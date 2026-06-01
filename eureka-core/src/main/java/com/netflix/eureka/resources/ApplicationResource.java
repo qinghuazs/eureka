@@ -140,12 +140,18 @@ public class ApplicationResource {
      *            a header parameter containing information whether this is
      *            replicated from other nodes.
      */
+    // 【服务注册的 REST 入口】处理 POST /v2/apps/{appName} 请求。
+    // 调用方有两类，通过请求头 x-netflix-discovery-replication 区分：
+    //   1. Eureka 客户端的注册请求（DiscoveryClient.register() 发起，无该请求头）
+    //   2. 其他 Eureka 节点的复制请求（PeerEurekaNode 发起，请求头值为 "true"）
+    // 处理流程：参数校验 → AWS 数据中心信息兼容处理 → 调用注册表完成注册 → 返回 204
     @POST
     @Consumes({"application/json", "application/xml"})
     public Response addInstance(InstanceInfo info,
                                 @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication) {
         logger.debug("Registering instance {} (replication={})", info.getId(), isReplication);
         // validate that the instanceinfo contains all the necessary required fields
+        // 必填字段校验：实例ID、主机名、IP、应用名、数据中心信息缺一不可，否则返回 400
         if (isBlank(info.getId())) {
             return Response.status(400).entity("Missing instanceId").build();
         } else if (isBlank(info.getHostName())) {
@@ -155,6 +161,7 @@ public class ApplicationResource {
         } else if (isBlank(info.getAppName())) {
             return Response.status(400).entity("Missing appName").build();
         } else if (!appName.equals(info.getAppName())) {
+            // URL 路径中的应用名必须与请求体中的应用名一致
             return Response.status(400).entity("Mismatched appName, expecting " + appName + " but was " + info.getAppName()).build();
         } else if (info.getDataCenterInfo() == null) {
             return Response.status(400).entity("Missing dataCenterInfo").build();
@@ -163,6 +170,8 @@ public class ApplicationResource {
         }
 
         // handle cases where clients may be registering with bad DataCenterInfo with missing data
+        // 兼容性处理：部分客户端上报的 AWS 数据中心信息(AmazonInfo)缺少 instanceId，
+        // 默认行为是用实例自身的 ID 补齐（开启实验性配置时则直接拒绝注册）
         DataCenterInfo dataCenterInfo = info.getDataCenterInfo();
         if (dataCenterInfo instanceof UniqueIdentifier) {
             String dataCenterInfoId = ((UniqueIdentifier) dataCenterInfo).getId();
@@ -183,7 +192,9 @@ public class ApplicationResource {
             }
         }
 
+        // 调用 PeerAwareInstanceRegistryImpl.register() 完成：本地注册 + 集群复制
         registry.register(info, "true".equals(isReplication));
+        // 返回 204 No Content（历史兼容原因，注册成功没有响应体）
         return Response.status(204).build();  // 204 to be backwards compatible
     }
 

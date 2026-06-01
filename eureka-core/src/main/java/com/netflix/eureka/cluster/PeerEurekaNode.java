@@ -131,12 +131,20 @@ public class PeerEurekaNode {
      *            that is send to this instance.
      * @throws Exception
      */
+    // 【复制注册到对等节点】注意这是异步的：并不直接发 HTTP 请求，
+    // 而是把"注册复制任务"提交给批处理分发器（batchingDispatcher）。
+    // 后台线程会把同一时间窗口内（默认 500ms）发往同一节点的多个复制任务合并成一个
+    // 批量请求（POST /peerreplication/batch/）发送，大幅减少集群间的 HTTP 请求数。
+    // 任务设有过期时间（当前时间 + 租约时长）：积压超时的任务直接丢弃 ——
+    // 因为后续的心跳复制会触发数据修复，丢任务不影响最终一致性
     public void register(final InstanceInfo info) throws Exception {
         long expiryTime = System.currentTimeMillis() + getLeaseRenewalOf(info);
         batchingDispatcher.process(
+                // 任务 ID = "register" + 应用名 + 实例ID：相同实例的多次注册任务会被去重合并，只保留最新的
                 taskId("register", info),
                 new InstanceReplicationTask(targetHost, Action.Register, info, null, true) {
                     public EurekaHttpResponse<Void> execute() {
+                        // 真正执行时：向 peer 节点发起注册请求（带 x-netflix-discovery-replication: true 请求头）
                         return replicationClient.register(info);
                     }
                 },

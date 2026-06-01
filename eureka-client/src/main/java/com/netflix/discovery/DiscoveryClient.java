@@ -887,10 +887,17 @@ public class DiscoveryClient implements EurekaClient {
     /**
      * Register with the eureka service by making the appropriate REST call.
      */
+    // 【客户端注册】把本实例的 InstanceInfo 通过 HTTP POST 发送给 Eureka 服务端。
+    // 触发时机有三个（都由 InstanceInfoReplicator 调度执行）：
+    //   1. 客户端启动后首次注册（默认延迟 40s，等实例信息和状态就绪）
+    //   2. 本地实例信息发生变更被标记为 dirty 后（定时任务每 30s 检查一次）
+    //   3. 心跳续约收到 404（服务端不认识本实例）后立即重新注册
+    // 对应服务端接口：ApplicationResource.addInstance()，注册成功返回 204
     boolean register() throws Throwable {
         logger.info(PREFIX + "{}: registering service...", appPathIdentifier);
         EurekaHttpResponse<Void> httpResponse;
         try {
+            // 通过传输层发起 POST /v2/apps/{appName} 请求，请求体为本实例的完整 InstanceInfo
             httpResponse = eurekaTransport.registrationClient.register(instanceInfo);
         } catch (Exception e) {
             logger.warn(PREFIX + "{} - registration failed {}", appPathIdentifier, e.getMessage(), e);
@@ -899,6 +906,7 @@ public class DiscoveryClient implements EurekaClient {
         if (logger.isInfoEnabled()) {
             logger.info(PREFIX + "{} - registration status: {}", appPathIdentifier, httpResponse.getStatusCode());
         }
+        // 服务端返回 204 No Content 即注册成功
         return httpResponse.getStatusCode() == Status.NO_CONTENT.getStatusCode();
     }
 

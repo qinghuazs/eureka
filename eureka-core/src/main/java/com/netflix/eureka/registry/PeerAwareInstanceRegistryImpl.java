@@ -402,13 +402,21 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      *            true if this is a replication event from other replica nodes,
      *            false otherwise.
      */
+    // 【集群感知的注册入口】REST 层(ApplicationResource.addInstance)调用的就是这个方法。
+    // 职责 = 本地注册（委托父类） + 集群复制（广播给其他 peer 节点），两步：
+    //   1. 确定租约时长：优先用客户端自带的 LeaseInfo（可自定义），否则用默认 90 秒
+    //   2. 本地注册完成后，把 Register 动作复制给所有 peer 节点
     @Override
     public void register(final InstanceInfo info, final boolean isReplication) {
+        // 租约时长默认 90 秒（DEFAULT_DURATION_IN_SECS）
         int leaseDuration = Lease.DEFAULT_DURATION_IN_SECS;
+        // 客户端在 LeaseInfo 中自定义了租约时长（eureka.lease.duration 配置），则采用客户端的值
         if (info.getLeaseInfo() != null && info.getLeaseInfo().getDurationInSecs() > 0) {
             leaseDuration = info.getLeaseInfo().getDurationInSecs();
         }
+        // 调用 AbstractInstanceRegistry.register() 完成本地内存注册表的写入
         super.register(info, leaseDuration, isReplication);
+        // 把本次注册动作复制给集群中的其他 Eureka 节点（若本次就是复制事件则不会再转发，防止无限循环）
         replicateToPeers(Action.Register, info.getAppName(), info.getId(), info, null, isReplication);
     }
 
@@ -626,21 +634,33 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * traffic to this node.
      *
      */
+    // 【集群复制总入口】把本节点收到的客户端操作（注册/续约/下线/状态变更）广播给所有 peer 节点。
+    // 关键设计 —— 复制只有"一跳"：
+    //   客户端 → 节点A → 节点B/C（到此为止，B/C 不会再转发给别人）
+    // 通过 isReplication 标志位实现：A 转发给 B 时该标志为 true，B 收到后只落本地、不再转发，
+    // 否则会形成 A→B→C→A... 的"毒性复制"（poison replication）无限循环
     private void replicateToPeers(Action action, String appName, String id,
                                   InstanceInfo info /* optional */,
                                   InstanceStatus newStatus /* optional */, boolean isReplication) {
+        // 监控计时器：记录每种动作（Register/Heartbeat/Cancel...）的复制耗时
         Stopwatch tracer = action.getTimer().start();
         try {
+            // 收到的是其他节点复制来的请求 → 累加"最近一分钟复制次数"指标（Dashboard 展示用）
             if (isReplication) {
                 numberOfReplicationsLastMin.increment();
             }
             // If it is a replication already, do not replicate again as this will create a poison replication
+            // 两种情况直接返回，不做复制：
+            //   1. 没有 peer 节点（单机部署）
+            //   2. 本次请求本身就是复制事件（防止复制风暴）
             if (peerEurekaNodes == Collections.EMPTY_LIST || isReplication) {
                 return;
             }
 
+            // 遍历所有 peer 节点，逐个复制
             for (final PeerEurekaNode node : peerEurekaNodes.getPeerEurekaNodes()) {
                 // If the url represents this host, do not replicate to yourself.
+                // 跳过自己（peer 列表配置中可能包含本机地址）
                 if (peerEurekaNodes.isThisMyUrl(node.getServiceUrl())) {
                     continue;
                 }
@@ -656,6 +676,10 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * replication traffic to this node.
      *
      */
+    // 【单节点复制分发】根据动作类型，把对应的操作转发给某一个 peer 节点。
+    // 注意：这里调用 node.xxx() 并不是同步发 HTTP 请求，而是把任务提交到 PeerEurekaNode 内部的
+    // 批处理分发器（batchingDispatcher），由后台线程合并成批量请求异步发送 —— 复制是异步且尽力而为的。
+    // 复制失败只记录日志不抛异常，不影响本地注册结果（AP 设计：可用性优先于一致性）
     private void replicateInstanceActionsToPeers(Action action, String appName,
                                                  String id, InstanceInfo info, InstanceStatus newStatus,
                                                  PeerEurekaNode node) {
@@ -664,26 +688,33 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             CurrentRequestVersion.set(Version.V2);
             switch (action) {
                 case Cancel:
+                    // 下线：通知 peer 节点删除该实例
                     node.cancel(appName, id);
                     break;
                 case Heartbeat:
+                    // 续约：把本地注册表中的实例信息 + 覆盖状态一起发给 peer，
+                    // peer 收到后若发现数据不一致（404/409），会触发数据修复
                     InstanceStatus overriddenStatus = overriddenInstanceStatusMap.get(id);
                     infoFromRegistry = getInstanceByAppAndId(appName, id, false);
                     node.heartbeat(appName, id, infoFromRegistry, overriddenStatus, false);
                     break;
                 case Register:
+                    // 注册：把新实例信息发给 peer 节点
                     node.register(info);
                     break;
                 case StatusUpdate:
+                    // 状态变更：如运维把实例置为 OUT_OF_SERVICE
                     infoFromRegistry = getInstanceByAppAndId(appName, id, false);
                     node.statusUpdate(appName, id, newStatus, infoFromRegistry);
                     break;
                 case DeleteStatusOverride:
+                    // 删除覆盖状态：恢复实例自身上报的状态
                     infoFromRegistry = getInstanceByAppAndId(appName, id, false);
                     node.deleteStatusOverride(appName, id, infoFromRegistry);
                     break;
             }
         } catch (Throwable t) {
+            // 复制失败不影响本地操作的成功返回，只记录错误日志（最终一致性由心跳复制兜底修复）
             logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);
         } finally {
             CurrentRequestVersion.remove();

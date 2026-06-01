@@ -190,11 +190,21 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      *
      * @see com.netflix.eureka.lease.LeaseManager#register(java.lang.Object, int, boolean)
      */
+    // 【服务注册核心实现】把实例信息(InstanceInfo)包装成租约(Lease)写入内存注册表。
+    // 注册表结构：ConcurrentHashMap<应用名, Map<实例ID, Lease<InstanceInfo>>>（双层 Map）
+    // 调用来源有两个：
+    //   1. ApplicationResource.addInstance() —— 客户端发起的注册请求（isReplication=false）
+    //   2. PeerReplicationResource —— 其他 Eureka 节点复制过来的注册（isReplication=true）
     public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
+        // 加"读锁"而非写锁：允许多个实例并发注册（注册操作只修改内层 ConcurrentHashMap，本身线程安全）；
+        // "写锁"留给需要一致性遍历整个注册表的操作（如获取增量 getApplicationDeltas），与注册互斥
         read.lock();
         try {
+            // 第一层 Map：按应用名(appName)取出该应用下所有实例的租约 Map
             Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
+            // 注册监控计数器 +1（区分客户端注册 / 集群复制，用于 Dashboard 与监控指标）
             REGISTER.increment(isReplication);
+            // 该应用第一次有实例注册：用 putIfAbsent 原子地创建内层 Map，防止并发创建时互相覆盖
             if (gMap == null) {
                 final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
                 gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
@@ -202,8 +212,10 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     gMap = gNewMap;
                 }
             }
+            // 第二层 Map：按实例 ID 查找是否已存在租约（重复注册/客户端重启/复制冲突的场景）
             Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
             // Retain the last dirty timestamp without overwriting it, if there is already a lease
+            // 已存在租约：发生注册冲突，用 lastDirtyTimestamp（实例信息的"版本号"）决定保留哪份数据
             if (existingLease != null && (existingLease.getHolder() != null)) {
                 Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
                 Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
@@ -211,32 +223,42 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
                 // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
                 // InstanceInfo instead of the server local copy.
+                // 注意是 > 而不是 >=：时间戳相等时，优先采用对端传来的数据（保证复制场景下的最终一致）
                 if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
                     logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
                             " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
                     logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
+                    // 服务端已有的数据更新 → 丢弃本次注册的数据，改用已有数据完成后续流程
                     registrant = existingLease.getHolder();
                 }
             } else {
                 // The lease does not exist and hence it is a new registration
+                // 全新注册：需要更新"自我保护机制"的统计基数
                 synchronized (lock) {
                     if (this.expectedNumberOfClientsSendingRenews > 0) {
                         // Since the client wants to register it, increase the number of clients sending renews
+                        // 期望发送续约心跳的客户端数 +1，并重新计算每分钟续约阈值（自我保护的判断依据）
                         this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
                         updateRenewsPerMinThreshold();
                     }
                 }
                 logger.debug("No previous lease information found; it is new registration");
             }
+            // 创建新租约（leaseDuration 默认 90s，客户端可自定义）
             Lease<InstanceInfo> lease = new Lease<>(registrant, leaseDuration);
             if (existingLease != null) {
+                // 继承旧租约的服务启动时间，避免重复注册导致"服务上线时间"被重置
                 lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
             }
+            // 【真正的注册动作】把租约放入注册表，至此实例已"注册"完成
             gMap.put(registrant.getId(), lease);
+            // 加入最近注册队列（环形队列，容量 1000，仅供 Dashboard 展示与调试）
             recentRegisteredQueue.add(new Pair<Long, String>(
                     System.currentTimeMillis(),
                     registrant.getAppName() + "(" + registrant.getId() + ")"));
             // This is where the initial state transfer of overridden status happens
+            // 处理"覆盖状态"（overriddenStatus）：运维通过 API 手动把实例置为 OUT_OF_SERVICE 等状态后，
+            // 即使实例重新注册，覆盖状态也要保留（存在 overriddenInstanceStatusMap 中，1 小时无访问自动过期）
             if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
                 logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
                                 + "overrides", registrant.getOverriddenStatus(), registrant.getId());
@@ -252,16 +274,22 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
             }
 
             // Set the status based on the overridden status rules
+            // 根据状态覆盖规则链（FirstMatchWinsCompositeRule）计算实例的最终对外状态
             InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
             registrant.setStatusWithoutDirty(overriddenInstanceStatus);
 
             // If the lease is registered with UP status, set lease service up timestamp
+            // 如果注册时实例状态是 UP，记录租约的服务上线时间戳（只在第一次生效）
             if (InstanceStatus.UP.equals(registrant.getStatus())) {
                 lease.serviceUp();
             }
+            // 标记动作类型为 ADDED，并加入"最近变更队列"——客户端增量拉取(delta)的数据来源，
+            // 队列中的条目默认保留 3 分钟（retentionTimeInMSInDeltaQueue）
             registrant.setActionType(ActionType.ADDED);
             recentlyChangedQueue.add(new RecentlyChangedItem(lease));
             registrant.setLastUpdatedTimestamp();
+            // 失效响应缓存（ResponseCache）中该应用相关的条目，
+            // 让后续客户端拉取注册表时能读到这次注册的最新数据
             invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
             logger.info("Registered instance {}/{} with status {} (replication={})",
                     registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
@@ -1180,11 +1208,18 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         return list;
     }
 
+    // 【缓存失效】注册/下线/状态变更后，把 ResponseCache（读写缓存层）中该应用、VIP、SecureVIP
+    // 对应的缓存条目标记失效。注意：只失效 readWriteCacheMap，readOnlyCacheMap 要等最多 30s 的
+    // 定时同步后才能看到新数据 —— 这是 Eureka "最终一致性"（AP）的体现之一
     private void invalidateCache(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
         // invalidate cache
         responseCache.invalidate(appName, vipAddress, secureVipAddress);
     }
 
+    // 【自我保护阈值计算】每分钟期望收到的最少续约次数 =
+    //   期望续约的客户端数 × (60秒 / 客户端续约间隔[默认30s]) × 续约百分比阈值[默认0.85]
+    // 例：100 个客户端 → 100 × 2 × 0.85 = 170 次/分钟。
+    // 若实际每分钟续约数低于该阈值，且开启了自我保护，则服务端停止剔除过期实例（认为是网络分区而非实例宕机）
     protected void updateRenewsPerMinThreshold() {
         this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
                 * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
@@ -1329,6 +1364,12 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      */
     protected abstract InstanceStatusOverrideRule getInstanceInfoOverrideRule();
 
+    // 【状态覆盖规则】注册时计算实例的最终对外状态。
+    // 实际规则链由子类 PeerAwareInstanceRegistryImpl 提供（FirstMatchWinsCompositeRule，按顺序匹配）：
+    //   1. DownOrStartingRule    —— 实例自报 DOWN/STARTING 时，直接采用该状态
+    //   2. OverrideExistsRule    —— 存在运维设置的覆盖状态时，采用覆盖状态
+    //   3. LeaseExistsRule       —— 已有租约且非复制请求时，沿用服务端已记录的状态
+    //   4. AlwaysMatchInstanceStatusRule（兜底）—— 直接用实例自带的状态
     protected InstanceInfo.InstanceStatus getOverriddenInstanceStatus(InstanceInfo r,
                                                                     Lease<InstanceInfo> existingLease,
                                                                     boolean isReplication) {
