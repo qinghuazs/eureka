@@ -94,14 +94,22 @@ public class RetryableEurekaHttpClient extends EurekaHttpClientDecorator {
         }
     }
 
+    // 【重试层装饰器】客户端高可用的核心：单台 Server 故障时自动切换到下一台。
+    // 工作机制：
+    //   1. 正常情况：复用上次成功的客户端（delegate），不做任何额外操作
+    //   2. 失败时（连接异常或 5xx）：把当前 Server 加入"隔离区"，换下一个候选 Server 重试
+    //   3. 最多重试 3 次（DEFAULT_NUMBER_OF_RETRIES），耗尽后抛 TransportException
+    // 这就是"配置了多个 eureka serviceUrl 后，挂一台不影响客户端"的实现原理
     @Override
     protected <R> EurekaHttpResponse<R> execute(RequestExecutor<R> requestExecutor) {
         List<EurekaEndpoint> candidateHosts = null;
         int endpointIdx = 0;
         for (int retry = 0; retry < numberOfRetries; retry++) {
+            // delegate 缓存了上次成功的客户端：正常情况下直接复用，不重新选 Server
             EurekaHttpClient currentHttpClient = delegate.get();
             EurekaEndpoint currentEndpoint = null;
             if (currentHttpClient == null) {
+                // 没有可复用的客户端（首次请求 或 上次失败被清空）→ 从候选列表选一个 Server
                 if (candidateHosts == null) {
                     candidateHosts = getHostCandidates();
                     if (candidateHosts.isEmpty()) {
@@ -109,16 +117,20 @@ public class RetryableEurekaHttpClient extends EurekaHttpClientDecorator {
                     }
                 }
                 if (endpointIdx >= candidateHosts.size()) {
+                    // 所有候选 Server 都试过了仍失败
                     throw new TransportException("Cannot execute request on any known server");
                 }
 
+                // 按顺序取下一个候选 Server，为它创建客户端（内层是重定向层→Jersey）
                 currentEndpoint = candidateHosts.get(endpointIdx++);
                 currentHttpClient = clientFactory.newClient(currentEndpoint);
             }
 
             try {
                 EurekaHttpResponse<R> response = requestExecutor.execute(currentHttpClient);
+                // 状态评估器判断响应是否可接受（非 5xx 等）
                 if (serverStatusEvaluator.accept(response.getStatusCode(), requestExecutor.getRequestType())) {
+                    // 成功：缓存这个客户端供后续请求复用
                     delegate.set(currentHttpClient);
                     if (retry > 0) {
                         logger.info("Request execution succeeded on retry #{}", retry);
@@ -131,6 +143,7 @@ public class RetryableEurekaHttpClient extends EurekaHttpClientDecorator {
             }
 
             // Connection error or 5xx from the server that must be retried on another server
+            // 失败处理：清空缓存的客户端 + 把这台 Server 加入隔离区（下次选候选时排除它）
             delegate.compareAndSet(currentHttpClient, null);
             if (currentEndpoint != null) {
                 quarantineSet.add(currentEndpoint);
@@ -158,11 +171,18 @@ public class RetryableEurekaHttpClient extends EurekaHttpClientDecorator {
         };
     }
 
+    // 【候选 Server 选择 + 隔离区管理】
+    // 隔离区(quarantineSet)：最近失败过的 Server 集合，选候选时排除它们。
+    // 自愈机制：当隔离的 Server 数量达到阈值（默认 66% 的 Server 都被隔离了），
+    // 说明可能不是 Server 的问题（比如客户端自己网络抖动），清空隔离区重新尝试所有 Server
     private List<EurekaEndpoint> getHostCandidates() {
+        // 从解析器获取全部 Server 列表（来源：配置的 serviceUrl / DNS）
         List<EurekaEndpoint> candidateHosts = clusterResolver.getClusterEndpoints();
+        // 清理隔离区中已经不在集群列表里的 Server（集群缩容场景）
         quarantineSet.retainAll(candidateHosts);
 
         // If enough hosts are bad, we have no choice but start over again
+        // 隔离阈值 = Server 总数 × 66%（retryableClientQuarantineRefreshPercentage 默认 0.66）
         int threshold = (int) (candidateHosts.size() * transportConfig.getRetryableClientQuarantineRefreshPercentage());
         //Prevent threshold is too large
         if (threshold > candidateHosts.size()) {
@@ -171,9 +191,11 @@ public class RetryableEurekaHttpClient extends EurekaHttpClientDecorator {
         if (quarantineSet.isEmpty()) {
             // no-op
         } else if (quarantineSet.size() >= threshold) {
+            // 隔离的太多了 → 清空隔离区，给所有 Server 重新机会
             logger.debug("Clearing quarantined list of size {}", quarantineSet.size());
             quarantineSet.clear();
         } else {
+            // 正常情况：候选列表 = 全部 Server - 隔离区
             List<EurekaEndpoint> remainingHosts = new ArrayList<>(candidateHosts.size());
             for (EurekaEndpoint endpoint : candidateHosts) {
                 if (!quarantineSet.contains(endpoint)) {

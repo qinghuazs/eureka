@@ -12,6 +12,16 @@ import java.util.List;
  *
  * Created by Nikos Michalakis on 7/13/16.
  */
+// 【规则链组合器】责任链模式：按顺序执行规则，第一个"匹配"的规则决定实例的最终状态。
+// 解决的业务问题：实例的状态有多个"声音"——
+//   实例自己说（status）、运维说（覆盖状态）、服务端历史记录说（已有租约的状态），
+// 当它们冲突时听谁的？规则链的顺序就是话语权的优先级：
+//   标准链（PeerAwareInstanceRegistryImpl 构造）：
+//     ① DownOrStartingRule    —— 实例自报故障(DOWN/STARTING)最可信，直接采纳
+//     ② OverrideExistsRule    —— 运维设置过覆盖状态，听运维的
+//     ③ LeaseExistsRule       —— 服务端已有 UP/OUT_OF_SERVICE 记录，保持现状
+//     ④ AlwaysMatch（兜底）    —— 都不匹配时，用实例自报的状态
+// 所有规则在注册（register）和续约（renew）时都会被执行
 public class FirstMatchWinsCompositeRule implements InstanceStatusOverrideRule {
 
     private final InstanceStatusOverrideRule[] rules;

@@ -59,19 +59,25 @@ public class SessionedEurekaHttpClient extends EurekaHttpClientDecorator {
         Monitors.registerObject(name, this);
     }
 
+    // 【会话层装饰器】每个请求经过时检查"会话"是否过期，过期则丢弃旧连接、重建整条客户端链。
+    // 解决的问题：客户端一旦连上某台 Server 就会一直用它（连接复用），导致 Server 间负载不均、
+    // 新扩容的 Server 接不到流量。定期强制重建("会话过期")让客户端有机会换一台 Server。
     @Override
     protected <R> EurekaHttpResponse<R> execute(RequestExecutor<R> requestExecutor) {
         long now = System.currentTimeMillis();
         long delay = now - lastReconnectTimeStamp;
+        // 会话过期（默认 20 分钟 ± 随机量）→ 关闭旧客户端，下面会重建
         if (delay >= currentSessionDurationMs) {
             logger.debug("Ending a session and starting anew");
             lastReconnectTimeStamp = now;
+            // 重新随机化下次会话时长（防止所有客户端同时重连造成"重连风暴"）
             currentSessionDurationMs = randomizeSessionDuration(sessionDurationMs);
             TransportUtils.shutdown(eurekaHttpClientRef.getAndSet(null));
         }
 
         EurekaHttpClient eurekaHttpClient = eurekaHttpClientRef.get();
         if (eurekaHttpClient == null) {
+            // 通过工厂重建内层客户端链（重试层→重定向层→Jersey）
             eurekaHttpClient = TransportUtils.getOrSetAnotherClient(eurekaHttpClientRef, clientFactory.newClient());
         }
         return requestExecutor.execute(eurekaHttpClient);

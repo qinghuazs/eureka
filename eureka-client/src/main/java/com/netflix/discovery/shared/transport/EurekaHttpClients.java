@@ -70,6 +70,14 @@ public final class EurekaHttpClients {
         return canonicalClientFactory(EurekaClientNames.REGISTRATION, transportConfig, bootstrapResolver, transportClientFactory);
     }
 
+    // 【装饰器链组装工厂】客户端所有 HTTP 通信能力在这里分层叠加（装饰器模式的教科书实现）。
+    // 包装顺序（从外到内，请求依次穿过）：
+    //   SessionedEurekaHttpClient   —— 会话层：定期(默认20分钟±随机)强制重建连接,防止粘连单台Server
+    //     └ RetryableEurekaHttpClient  —— 重试层：失败自动切换下一个Server(默认3次),坏节点进隔离区
+    //         └ RedirectingEurekaHttpClient —— 重定向层：跟随302跳转(最多10次)
+    //             └ JerseyApplicationClient   —— 真正发HTTP请求的Jersey客户端
+    // DiscoveryClient 中的 registrationClient（注册/心跳/下线）和 queryClient（拉取注册表）
+    // 都是用这个工厂创建的,只是底层的 Server 列表解析器(ClusterResolver)不同
     static EurekaHttpClientFactory canonicalClientFactory(final String name,
                                                           final EurekaTransportConfig transportConfig,
                                                           final ClusterResolver<EurekaEndpoint> clusterResolver,
@@ -78,13 +86,17 @@ public final class EurekaHttpClients {
         return new EurekaHttpClientFactory() {
             @Override
             public EurekaHttpClient newClient() {
+                // 最外层：会话管理（持有重试层的工厂，会话过期时通过工厂重建整条链）
                 return new SessionedEurekaHttpClient(
                         name,
+                        // 中间层：重试与故障转移（持有重定向层的工厂，每次换 Server 时新建内层客户端）
                         RetryableEurekaHttpClient.createFactory(
                                 name,
                                 transportConfig,
                                 clusterResolver,
+                                // 内层：302 重定向跟随
                                 RedirectingEurekaHttpClient.createFactory(transportClientFactory),
+                                // 状态评估器：决定哪些 HTTP 状态码算"失败需要重试"（5xx等）
                                 ServerStatusEvaluators.legacyEvaluator()),
                         transportConfig.getSessionedClientReconnectIntervalSeconds() * 1000
                 );
