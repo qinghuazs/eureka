@@ -426,6 +426,11 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * @see com.netflix.eureka.registry.InstanceRegistry#renew(java.lang.String,
      * java.lang.String, long, boolean)
      */
+    // 【集群感知的续约入口】REST 层(InstanceResource.renewLease)调用的就是这个方法。
+    // 本地续约成功后，把 Heartbeat 动作复制给所有 peer 节点 ——
+    // 心跳复制是集群数据一致性的"巡检"机制：peer 收到心跳后若发现实例不存在(404)
+    // 或数据版本冲突(409)，会触发该实例数据的修复同步（见 PeerEurekaNode.heartbeat 的失败处理）。
+    // 注意：本地续约失败（返回 false）不会复制，REST 层会直接返回 404 让客户端重新注册
     public boolean renew(final String appName, final String id, final boolean isReplication) {
         if (super.renew(appName, id, isReplication)) {
             replicateToPeers(Action.Heartbeat, appName, id, null, null, isReplication);

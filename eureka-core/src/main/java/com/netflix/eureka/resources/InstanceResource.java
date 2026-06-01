@@ -102,6 +102,10 @@ public class InstanceResource {
      * @return response indicating whether the operation was a success or
      *         failure.
      */
+    // 【心跳续约的 REST 入口】处理 PUT /v2/apps/{appName}/{instanceId} 请求。
+    // 调用方：① Eureka 客户端的 HeartbeatThread（每 30s）② 其他节点复制过来的心跳。
+    // 续约同时承担"数据对账"职责：通过比较 lastDirtyTimestamp 发现客户端与服务端、
+    // 节点与节点之间的数据不一致，并通过 404/409 响应码触发数据修复
     @PUT
     public Response renewLease(
             @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication,
@@ -109,19 +113,24 @@ public class InstanceResource {
             @QueryParam("status") String status,
             @QueryParam("lastDirtyTimestamp") String lastDirtyTimestamp) {
         boolean isFromReplicaNode = "true".equals(isReplication);
+        // 调用注册表执行续约（更新租约的最近续约时间戳）
         boolean isSuccess = registry.renew(app.getName(), id, isFromReplicaNode);
 
         // Not found in the registry, immediately ask for a register
+        // 续约失败（实例不在注册表中）→ 返回 404，客户端收到后会立即重新注册
         if (!isSuccess) {
             logger.warn("Not Found (Renew): {} - {}", app.getName(), id);
             return Response.status(Status.NOT_FOUND).build();
         }
         // Check if we need to sync based on dirty time stamp, the client
         // instance might have changed some value
+        // 续约成功后的"数据对账"：比较请求带来的 lastDirtyTimestamp 与服务端记录是否一致
         Response response;
         if (lastDirtyTimestamp != null && serverConfig.shouldSyncWhenTimestampDiffers()) {
             response = this.validateDirtyTimestamp(Long.valueOf(lastDirtyTimestamp), isFromReplicaNode);
             // Store the overridden status since the validation found out the node that replicates wins
+            // 复制场景下且响应为 404（对方数据更新）：先把对方的覆盖状态存下来，
+            // 因为接下来对方会用"重新注册"的方式把完整数据推过来
             if (response.getStatus() == Response.Status.NOT_FOUND.getStatusCode()
                     && (overriddenStatus != null)
                     && !(InstanceStatus.UNKNOWN.name().equals(overriddenStatus))
@@ -295,6 +304,13 @@ public class InstanceResource {
 
     }
 
+    // 【数据对账核心】比较心跳请求带来的 lastDirtyTimestamp 与服务端注册表中的记录，
+    // 用响应码驱动数据修复，这是 Eureka 集群最终一致性的关键机制：
+    //   - 请求方数据更新（请求时间戳 > 服务端） → 返回 404：
+    //     "我的数据旧了，请你重新注册把新数据推给我"
+    //   - 服务端数据更新（服务端时间戳 > 请求） → 复制场景返回 409 + 服务端数据：
+    //     "你的数据旧了，这是我的新数据，你拿回去同步"（普通客户端心跳则直接放行 200）
+    //   - 时间戳一致 → 200，数据无需修复
     private Response validateDirtyTimestamp(Long lastDirtyTimestamp,
                                             boolean isReplication) {
         InstanceInfo appInfo = registry.getInstanceByAppAndId(app.getName(), id, false);
@@ -302,6 +318,7 @@ public class InstanceResource {
             if ((lastDirtyTimestamp != null) && (!lastDirtyTimestamp.equals(appInfo.getLastDirtyTimestamp()))) {
                 Object[] args = {id, appInfo.getLastDirtyTimestamp(), lastDirtyTimestamp, isReplication};
 
+                // 请求方的数据比服务端新 → 404，让请求方重新注册（带上新数据）
                 if (lastDirtyTimestamp > appInfo.getLastDirtyTimestamp()) {
                     logger.debug(
                             "Time to sync, since the last dirty timestamp differs -"
@@ -311,6 +328,9 @@ public class InstanceResource {
                 } else if (appInfo.getLastDirtyTimestamp() > lastDirtyTimestamp) {
                     // In the case of replication, send the current instance info in the registry for the
                     // replicating node to sync itself with this one.
+                    // 服务端的数据比请求方新：
+                    //   复制场景 → 409 Conflict + 返回服务端数据，复制方收到后用该数据覆盖自己
+                    //   普通客户端心跳 → 直接 200（客户端数据旧不影响续约本身）
                     if (isReplication) {
                         logger.debug(
                                 "Time to sync, since the last dirty timestamp differs -"

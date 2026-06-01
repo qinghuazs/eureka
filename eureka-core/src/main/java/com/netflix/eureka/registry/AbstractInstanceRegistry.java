@@ -376,13 +376,21 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      *
      * @see com.netflix.eureka.lease.LeaseManager#renew(java.lang.String, java.lang.String, boolean)
      */
+    // 【服务端续约核心实现】更新实例租约的最近续约时间戳，维持实例"存活"。
+    // 与注册不同：续约是高频轻量操作（每实例每 30s 一次），不加锁、不失效缓存、不进增量队列。
+    // 返回 false 的两种情况都会导致 REST 层返回 404，触发客户端重新注册：
+    //   1. 租约不存在（服务端重启/实例已被剔除）
+    //   2. 覆盖状态为 UNKNOWN（覆盖状态被删除，需要重新注册来恢复正确状态）
     public boolean renew(String appName, String id, boolean isReplication) {
+        // 续约监控计数（区分客户端续约/集群复制续约）
         RENEW.increment(isReplication);
+        // 从双层 Map 中查找该实例的租约
         Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
         Lease<InstanceInfo> leaseToRenew = null;
         if (gMap != null) {
             leaseToRenew = gMap.get(id);
         }
+        // 租约不存在 → 续约失败（"Not Found"计数 +1），REST 层将返回 404
         if (leaseToRenew == null) {
             RENEW_NOT_FOUND.increment(isReplication);
             logger.warn("DS: Registry: lease doesn't exist, registering resource: {} - {}", appName, id);
@@ -391,14 +399,17 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
             InstanceInfo instanceInfo = leaseToRenew.getHolder();
             if (instanceInfo != null) {
                 // touchASGCache(instanceInfo.getASGName());
+                // 重新计算实例的"应然状态"（应用状态覆盖规则链）
                 InstanceStatus overriddenInstanceStatus = this.getOverriddenInstanceStatus(
                         instanceInfo, leaseToRenew, isReplication);
+                // 计算结果为 UNKNOWN：通常是覆盖状态被删除后规则链无法决策 → 要求客户端重新注册
                 if (overriddenInstanceStatus == InstanceStatus.UNKNOWN) {
                     logger.info("Instance status UNKNOWN possibly due to deleted override for instance {}"
                             + "; re-register required", instanceInfo.getId());
                     RENEW_NOT_FOUND.increment(isReplication);
                     return false;
                 }
+                // 实例当前状态与"应然状态"不一致 → 以覆盖规则计算的状态为准（静默修正，不标脏）
                 if (!instanceInfo.getStatus().equals(overriddenInstanceStatus)) {
                     logger.info(
                             "The instance status {} is different from overridden instance status {} for instance {}. "
@@ -409,7 +420,9 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
                 }
             }
+            // 自我保护统计：最近一分钟续约次数 +1（与 numberOfRenewsPerMinThreshold 阈值比较）
             renewsLastMin.increment();
+            // 【真正的续约动作】更新租约的 lastUpdateTimestamp（注意 Lease.renew() 的 +duration bug）
             leaseToRenew.renew();
             return true;
         }

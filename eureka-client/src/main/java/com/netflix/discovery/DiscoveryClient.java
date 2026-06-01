@@ -913,23 +913,33 @@ public class DiscoveryClient implements EurekaClient {
     /**
      * Renew with the eureka service by making the appropriate REST call
      */
+    // 【客户端心跳续约】由 HeartbeatThread 定时调用（默认每 30s 一次）。
+    // 通过 PUT /v2/apps/{appName}/{instanceId} 告诉服务端"我还活着"，维持租约不过期。
+    // 关键逻辑 —— 404 自愈：服务端找不到本实例（服务端重启丢数据/实例被剔除/从未注册成功）时
+    // 返回 404，客户端立即标脏并重新注册，实现"心跳即对账"的自我修复
     boolean renew() {
         EurekaHttpResponse<InstanceInfo> httpResponse;
         try {
+            // 发送心跳：PUT 请求，参数带上实例当前状态和 lastDirtyTimestamp（供服务端做数据一致性校验）
             httpResponse = eurekaTransport.registrationClient.sendHeartBeat(instanceInfo.getAppName(), instanceInfo.getId(), instanceInfo, null);
             logger.debug(PREFIX + "{} - Heartbeat status: {}", appPathIdentifier, httpResponse.getStatusCode());
+            // 服务端返回 404：本实例在服务端注册表中不存在 → 立即重新注册（自愈）
             if (httpResponse.getStatusCode() == Status.NOT_FOUND.getStatusCode()) {
                 REREGISTER_COUNTER.increment();
                 logger.info(PREFIX + "{} - Re-registering apps/{}", appPathIdentifier, instanceInfo.getAppName());
+                // 标脏（记录时间戳），保证 register() 会携带最新的实例信息
                 long timestamp = instanceInfo.setIsDirtyWithTime();
                 boolean success = register();
                 if (success) {
+                    // 重新注册成功后清除脏标记（CAS：若期间信息又变更则保留脏标记）
                     instanceInfo.unsetIsDirty(timestamp);
                 }
                 return success;
             }
+            // 返回 200 即续约成功
             return httpResponse.getStatusCode() == Status.OK.getStatusCode();
         } catch (Throwable e) {
+            // 网络异常等：续约失败，等待下个心跳周期重试（连续失败超过租约时长会被服务端剔除）
             logger.error(PREFIX + "{} - was unable to send heartbeat!", appPathIdentifier, e);
             return false;
         }
@@ -1347,6 +1357,10 @@ public class DiscoveryClient implements EurekaClient {
             logger.info("Starting heartbeat executor: " + "renew interval is: {}", renewalIntervalInSecs);
 
             // Heartbeat timer
+            // 【心跳定时任务】用 TimedSupervisorTask 包装 HeartbeatThread：
+            //   - 执行间隔 = renewalIntervalInSecs（来自 LeaseInfo，默认 30s）
+            //   - 单次执行超时也是 30s，超时后下次调度间隔翻倍（指数退避，最大 30s × expBackOffBound[默认10] = 300s）
+            //   - 网络长时间故障时退避可避免心跳请求堆积，恢复后间隔自动回到 30s
             heartbeatTask = new TimedSupervisorTask(
                     "heartbeat",
                     scheduler,
@@ -1477,6 +1491,9 @@ public class DiscoveryClient implements EurekaClient {
     /**
      * The heartbeat task that renews the lease in the given intervals.
      */
+    // 【心跳线程】被 TimedSupervisorTask 包装后定时执行（默认每 30s）。
+    // 逻辑极简：发一次心跳，成功则记录"最近一次心跳成功时间"（该时间戳用于监控心跳健康度，
+    // 通过 HeartbeatStalenessMonitor 暴露为指标）
     private class HeartbeatThread implements Runnable {
 
         public void run() {

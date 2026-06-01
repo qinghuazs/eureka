@@ -199,23 +199,31 @@ public class PeerEurekaNode {
      *            the overridden status information if any of the instance.
      * @throws Throwable
      */
+    // 【复制心跳到对等节点】心跳复制是集群数据"自愈"的核心载体。
+    // 提交异步批处理任务，真正发送时通过失败处理实现双向数据修复：
+    //   - peer 返回 404（peer 没有这个实例）→ 把实例重新注册到 peer（推数据过去）
+    //   - peer 返回 409（peer 的数据版本更新）→ 用 peer 返回的数据覆盖本地（拉数据回来）
+    // 这样即使注册复制曾经失败/丢失，靠每 30s 一次的心跳复制也能在分钟级内恢复一致
     public void heartbeat(final String appName, final String id,
                           final InstanceInfo info, final InstanceStatus overriddenStatus,
                           boolean primeConnection) throws Throwable {
         if (primeConnection) {
             // We do not care about the result for priming request.
+            // 连接预热请求：直接同步发送，不关心结果（仅用于建立 HTTP 连接）
             replicationClient.sendHeartBeat(appName, id, info, overriddenStatus);
             return;
         }
         ReplicationTask replicationTask = new InstanceReplicationTask(targetHost, Action.Heartbeat, info, overriddenStatus, false) {
             @Override
             public EurekaHttpResponse<InstanceInfo> execute() throws Throwable {
+                // 真正执行时：向 peer 节点发送心跳（PUT 请求，带 replication 请求头）
                 return replicationClient.sendHeartBeat(appName, id, info, overriddenStatus);
             }
 
             @Override
             public void handleFailure(int statusCode, Object responseEntity) throws Throwable {
                 super.handleFailure(statusCode, responseEntity);
+                // peer 返回 404：peer 节点上没有这个实例 → 把本节点的实例数据注册过去（修复 peer 的缺失）
                 if (statusCode == 404) {
                     logger.warn("{}: missing entry.", getTaskName());
                     if (info != null) {
@@ -224,6 +232,7 @@ public class PeerEurekaNode {
                         register(info);
                     }
                 } else if (config.shouldSyncWhenTimestampDiffers()) {
+                    // peer 返回 409 等冲突：peer 的数据版本比本节点新 → 用 peer 的数据修复本节点
                     InstanceInfo peerInstanceInfo = (InstanceInfo) responseEntity;
                     if (peerInstanceInfo != null) {
                         syncInstancesIfTimestampDiffers(appName, id, info, peerInstanceInfo);
@@ -231,6 +240,7 @@ public class PeerEurekaNode {
                 }
             }
         };
+        // 任务过期时间 = 当前时间 + 心跳间隔：积压超过一个心跳周期的任务没有意义（下次心跳会替代它），直接丢弃
         long expiryTime = System.currentTimeMillis() + getLeaseRenewalOf(info);
         batchingDispatcher.process(taskId("heartbeat", info), replicationTask, expiryTime);
     }
@@ -364,16 +374,21 @@ public class PeerEurekaNode {
      * Synchronize {@link InstanceInfo} information if the timestamp between
      * this node and the peer eureka nodes vary.
      */
+    // 【用 peer 数据修复本地】心跳复制收到 409 冲突响应（peer 数据版本更新）后调用。
+    // 把 peer 返回的实例数据"以复制的方式"注册进本地注册表（isReplication=true，不会再向外复制），
+    // 同时同步 peer 的覆盖状态。完成后两边数据版本一致 —— 这是"对账后修复"的最后一步
     private void syncInstancesIfTimestampDiffers(String appName, String id, InstanceInfo info, InstanceInfo infoFromPeer) {
         try {
             if (infoFromPeer != null) {
                 logger.warn("Peer wants us to take the instance information from it, since the timestamp differs,"
                         + "Id : {} My Timestamp : {}, Peer's timestamp: {}", id, info.getLastDirtyTimestamp(), infoFromPeer.getLastDirtyTimestamp());
 
+                // 先同步覆盖状态（如果 peer 上有的话）
                 if (infoFromPeer.getOverriddenStatus() != null && !InstanceStatus.UNKNOWN.equals(infoFromPeer.getOverriddenStatus())) {
                     logger.warn("Overridden Status info -id {}, mine {}, peer's {}", id, info.getOverriddenStatus(), infoFromPeer.getOverriddenStatus());
                     registry.storeOverriddenStatusIfRequired(appName, id, infoFromPeer.getOverriddenStatus());
                 }
+                // 用 peer 的数据覆盖本地（注册即更新；isReplication=true 防止二次复制）
                 registry.register(infoFromPeer, true);
             }
         } catch (Throwable e) {
