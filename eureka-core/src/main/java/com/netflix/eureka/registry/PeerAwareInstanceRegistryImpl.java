@@ -190,6 +190,10 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * many instances at a time.
      *
      */
+    // 【自我保护阈值的定时校准任务】每 15 分钟执行一次。
+    // 为什么需要：阈值基数(expectedNumberOfClientsSendingRenews)靠注册+1/下线-1维护，
+    // 但实例被"剔除"时不会-1（剔除不算主动下线），长期运行后基数会与实际客户端数偏离，
+    // 导致自我保护过于敏感或过于迟钝 —— 所以定期用"当前实际注册的实例数"重新校准
     private void scheduleRenewalThresholdUpdateTask() {
         timer.schedule(new TimerTask() {
                            @Override
@@ -380,6 +384,9 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * @see com.netflix.eureka.registry.InstanceRegistry#cancel(java.lang.String,
      * java.lang.String, long, boolean)
      */
+    // 【集群感知的主动下线入口】REST 层(InstanceResource.cancelLease)调用的就是这个方法。
+    // 本地下线成功后，把 Cancel 动作复制给所有 peer 节点。
+    // 注意：只有"主动下线"走这里会被复制；"被动剔除"(evict)直接调 internalCancel 不复制
     @Override
     public boolean cancel(final String appName, final String id,
                           final boolean isReplication) {
@@ -490,12 +497,21 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
         }
     }
 
+    // 【自我保护的核心判断】剔除任务(evict)每次执行前都先问这个方法："现在允许剔除吗？"
+    // 返回 false（禁止剔除）的条件：开启了自我保护 且 最近一分钟全局续约数 <= 阈值。
+    // 设计思想：大量实例同时"失联"更可能是网络分区/Eureka自身问题，而不是实例真的都挂了。
+    // 此时宁可保留可能已死的实例信息（调用方会失败重试），也不能把活着的实例全部剔除
+    // （那样整个微服务体系的调用关系会瞬间崩塌）—— 这是 AP 系统"可用性优先"的极致体现。
+    // 阈值计算见 updateRenewsPerMinThreshold()：客户端数 × 每分钟心跳数(2) × 0.85
     @Override
     public boolean isLeaseExpirationEnabled() {
         if (!isSelfPreservationModeEnabled()) {
             // The self preservation mode is disabled, hence allowing the instances to expire.
+            // 自我保护被关闭（shouldEnableSelfPreservation=false）→ 永远允许剔除
             return true;
         }
+        // 阈值>0 且 实际续约数>阈值 → 集群健康，允许剔除
+        // 实际续约数<=阈值 → 触发自我保护，禁止剔除（Dashboard 上会显示红色警告）
         return numberOfRenewsPerMinThreshold > 0 && getNumOfRenewsInLastMin() > numberOfRenewsPerMinThreshold;
     }
 
@@ -542,8 +558,13 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * {@link EurekaServerConfig#getRenewalPercentThreshold()} of renewals
      * received per minute {@link #getNumOfRenewsInLastMin()}.
      */
+    // 【自我保护阈值校准】用"本节点 EurekaClient 视角看到的实例数"重新校准期望客户端数。
+    // 注意条件：只有当实际数量 > 当前期望值×0.85 时才更新（或自我保护被关闭时无条件更新）——
+    // 这意味着实例数大幅下降时阈值"不会跟着降"，保护状态得以维持；
+    // 只有实例数恢复（重新注册回来）后阈值才会被刷新，自我保护才会自然解除
     private void updateRenewalThreshold() {
         try {
+            // 通过 EurekaClient 获取注册表（本节点同时也是其他节点的客户端）
             Applications apps = eurekaClient.getApplications();
             int count = 0;
             for (Application app : apps.getRegisteredApplications()) {
@@ -556,6 +577,7 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             synchronized (lock) {
                 // Update threshold only if the threshold is greater than the
                 // current expected threshold or if self preservation is disabled.
+                // 只有"实例数足够多"（>当前期望×0.85）或自我保护被关闭时才更新基数
                 if ((count) > (serverConfig.getRenewalPercentThreshold() * expectedNumberOfClientsSendingRenews)
                         || (!this.isSelfPreservationModeEnabled())) {
                     this.expectedNumberOfClientsSendingRenews = count;

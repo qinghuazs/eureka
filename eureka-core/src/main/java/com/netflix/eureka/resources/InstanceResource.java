@@ -283,10 +283,15 @@ public class InstanceResource {
      * @return response indicating whether the operation was a success or
      *         failure.
      */
+    // 【主动下线的 REST 入口】处理 DELETE /v2/apps/{appName}/{instanceId} 请求。
+    // 调用方：① 客户端优雅停机时 DiscoveryClient.shutdown() → unregister() ② 其他节点的下线复制。
+    // 与"被动剔除"（evict）的区别：主动下线会复制给 peer 节点并计入"期望续约客户端数"的减少；
+    // 被动剔除不复制（每个节点独立判断过期），且受自我保护机制约束
     @DELETE
     public Response cancelLease(
             @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication) {
         try {
+            // 调用 PeerAwareInstanceRegistryImpl.cancel()：本地下线 + 复制给 peer
             boolean isSuccess = registry.cancel(app.getName(), id,
                 "true".equals(isReplication));
 
@@ -294,6 +299,7 @@ public class InstanceResource {
                 logger.debug("Found (Cancel): {} - {}", app.getName(), id);
                 return Response.ok().build();
             } else {
+                // 实例不存在（可能已被剔除或从未注册）→ 404
                 logger.info("Not Found (Cancel): {} - {}", app.getName(), id);
                 return Response.status(Status.NOT_FOUND).build();
             }

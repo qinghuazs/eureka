@@ -964,19 +964,27 @@ public class DiscoveryClient implements EurekaClient {
      * Shuts down Eureka Client. Also sends a deregistration request to the
      * eureka server.
      */
+    // 【客户端优雅停机】@PreDestroy 保证 Spring/容器销毁 Bean 时自动调用。
+    // 停机顺序很讲究：先停定时任务（防止下线后又被心跳/注册"复活"）→ 再标记 DOWN → 最后发送下线请求。
+    // 这是"主动下线"路径的起点，对应服务端 InstanceResource.cancelLease()
     @PreDestroy
     @Override
     public synchronized void shutdown() {
+        // CAS 保证只执行一次
         if (isShutdown.compareAndSet(false, true)) {
             logger.info("Shutting down DiscoveryClient ...");
 
+            // 1. 注销状态变更监听器
             if (statusChangeListener != null && applicationInfoManager != null) {
                 applicationInfoManager.unregisterStatusChangeListener(statusChangeListener.getId());
             }
 
+            // 2. 停止三大定时任务（心跳/缓存刷新/实例信息同步）
             cancelScheduledTasks();
 
             // If APPINFO was registered
+            // 3. 把实例状态置为 DOWN 并向服务端发送下线请求（DELETE）
+            //    shouldUnregisterOnShutdown 可配置为 false（如蓝绿发布场景，希望保留注册信息）
             if (applicationInfoManager != null
                     && clientConfig.shouldRegisterWithEureka()
                     && clientConfig.shouldUnregisterOnShutdown()) {

@@ -322,36 +322,51 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      * cancel request is replicated to the peers. This is however not desired for expires which would be counted
      * in the remote peers as valid cancellations, so self preservation mode would not kick-in.
      */
+    // 【下线/剔除的共用核心实现】把实例的租约从注册表中移除。
+    // 两个调用方（这正是 cancel 与 internalCancel 分成两个方法的原因）：
+    //   1. cancel()  —— 客户端主动下线：会被 PeerAwareInstanceRegistryImpl 重写并复制给 peer 节点
+    //   2. evict()   —— 服务端被动剔除：直接调 internalCancel，不复制（每个节点独立判断过期），
+    //      否则剔除会被 peer 当作"主动下线"统计，导致 peer 的自我保护无法触发
     protected boolean internalCancel(String appName, String id, boolean isReplication) {
+        // 与注册相同：加读锁（下线之间可并发，与增量快照生成互斥）
         read.lock();
         try {
+            // 下线监控计数
             CANCEL.increment(isReplication);
             Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
             Lease<InstanceInfo> leaseToCancel = null;
+            // 【真正的移除动作】从内层 Map 中删除该实例的租约
             if (gMap != null) {
                 leaseToCancel = gMap.remove(id);
             }
+            // 加入最近下线队列（环形队列，容量 1000，Dashboard 展示用）
             recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
+            // 同时清理该实例的覆盖状态（实例都没了，覆盖状态也没有意义了）
             InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
             if (instanceStatus != null) {
                 logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
             }
             if (leaseToCancel == null) {
+                // 实例本来就不存在 → 下线失败（REST 层返回 404）
                 CANCEL_NOT_FOUND.increment(isReplication);
                 logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
                 return false;
             } else {
+                // 标记租约的下线时间戳（evictionTimestamp）
                 leaseToCancel.cancel();
                 InstanceInfo instanceInfo = leaseToCancel.getHolder();
                 String vip = null;
                 String svip = null;
                 if (instanceInfo != null) {
+                    // 标记动作类型为 DELETED 并加入最近变更队列 ——
+                    // 客户端增量拉取时会收到该 DELETED 记录，从而把实例从本地缓存中删除
                     instanceInfo.setActionType(ActionType.DELETED);
                     recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
                     instanceInfo.setLastUpdatedTimestamp();
                     vip = instanceInfo.getVIPAddress();
                     svip = instanceInfo.getSecureVipAddress();
                 }
+                // 失效响应缓存，让后续拉取能感知到该实例已下线
                 invalidateCache(appName, vip, svip);
                 logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
             }
@@ -359,6 +374,8 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
             read.unlock();
         }
 
+        // 自我保护统计基数调整：期望续约的客户端数 -1，并重新计算每分钟续约阈值
+        // 注意：这段在锁外执行（与注册时+1的逻辑对称）
         synchronized (lock) {
             if (this.expectedNumberOfClientsSendingRenews > 0) {
                 // Since the client wants to cancel it, reduce the number of clients to send renews.
@@ -624,9 +641,17 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         evict(0l);
     }
 
+    // 【被动剔除核心】由 EvictionTask 定时调用（默认每 60s），清理超时未续约的实例。
+    // 三层保护防止"误杀"（这是 Eureka AP 设计的精髓所在）：
+    //   1. 自我保护检查：全局续约数低于阈值时，直接放弃本次剔除（认为是网络问题不是实例挂了）
+    //   2. 剔除数量上限：单次最多剔除 注册表大小×(1-0.85)=15% 的实例，分批渐进式剔除
+    //   3. 随机剔除：在过期实例中随机挑选，避免把某个应用的实例一次性全部剔除
+    // additionalLeaseMs 是补偿时间：修正 GC 暂停/时钟漂移导致的任务延迟，避免误判过期
     public void evict(long additionalLeaseMs) {
         logger.debug("Running the evict task");
 
+        // 【保护第一层】自我保护检查：
+        // 开启自我保护 且 最近一分钟续约数 <= 阈值 → 认为发生了网络分区，跳过剔除
         if (!isLeaseExpirationEnabled()) {
             logger.debug("DS: lease expiration is currently disabled.");
             return;
@@ -635,6 +660,8 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         // We collect first all expired items, to evict them in random order. For large eviction sets,
         // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
         // the impact should be evenly distributed across all applications.
+        // 第一步：遍历整个注册表，收集所有已过期的租约
+        // （isExpired 判定：主动下线 或 当前时间 > 最近续约时间+90s+补偿时间，实际因bug是180s）
         List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
         for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
             Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
@@ -650,6 +677,9 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
         // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
         // triggering self-preservation. Without that we would wipe out full registry.
+        // 【保护第二层】计算单次剔除上限：
+        //   注册表 100 个实例 × 0.85 阈值 = 85 → 本次最多剔除 100-85 = 15 个
+        // 即使过期实例很多，也分多个周期逐步剔除，每个周期之间自我保护有机会重新触发
         int registrySize = (int) getLocalRegistrySize();
         int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
         int evictionLimit = registrySize - registrySizeThreshold;
@@ -658,6 +688,9 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         if (toEvict > 0) {
             logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
 
+            // 【保护第三层】随机剔除（Knuth洗牌算法）：
+            // 如果按顺序剔除，可能把排在前面的某个应用的实例全部剔除掉；
+            // 随机化让剔除的影响均匀分散到所有应用上
             Random random = new Random(System.currentTimeMillis());
             for (int i = 0; i < toEvict; i++) {
                 // Pick a random item (Knuth shuffle algorithm)
@@ -669,6 +702,8 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                 String id = lease.getHolder().getId();
                 EXPIRED.increment();
                 logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+                // 注意：调用 internalCancel 而非 cancel —— 剔除不复制给 peer 节点，
+                // 每个节点独立做自己的过期判断（否则剔除会破坏 peer 的自我保护统计）
                 internalCancel(appName, id, false);
             }
         }
@@ -1294,6 +1329,8 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         return overriddenInstanceStatusMap.size();
     }
 
+    // 【剔除定时任务】postInit() 中注册到 evictionTimer，默认每 60s 执行一次。
+    // 核心是"补偿时间"机制：解决 GC 暂停/时钟漂移导致的误剔除问题
     /* visible for testing */ class EvictionTask extends TimerTask {
 
         private final AtomicLong lastExecutionNanosRef = new AtomicLong(0l);
@@ -1301,6 +1338,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         @Override
         public void run() {
             try {
+                // 计算补偿时间，传给 evict() 加到过期判定中
                 long compensationTimeMs = getCompensationTimeMs();
                 logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
                 evict(compensationTimeMs);
@@ -1315,6 +1353,10 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
          * clock skew or gc for example) causes the actual eviction task to execute later than the desired time
          * according to the configured cycle.
          */
+        // 【补偿时间计算】= 两次任务执行的实际间隔 - 配置间隔(60s)
+        // 例：发生了 30s 的 Full GC，导致本次任务实际间隔 90s 才执行 → 补偿时间 = 30s
+        // 这 30s 内所有实例都没机会续约（服务端进程都暂停了），若不补偿会出现大面积误剔除。
+        // 把补偿时间加到过期判定上，相当于"时钟暂停期间不计入租约超时"
         long getCompensationTimeMs() {
             long currNanos = getCurrentTimeNano();
             long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
