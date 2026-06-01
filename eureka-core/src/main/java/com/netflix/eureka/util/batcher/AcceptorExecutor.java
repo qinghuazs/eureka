@@ -43,6 +43,19 @@ import static com.netflix.eureka.Names.METRIC_REPLICATION_PREFIX;
  *
  * @author Tomasz Bak
  */
+// 【批处理框架的"接收调度器"】集群复制高性能的核心，是一个生产者-消费者模型的中枢：
+//
+//   生产者：register/heartbeat/cancel 的复制任务 → acceptorQueue（接收队列）
+//   调度线程（acceptorThread）持续做三件事：
+//     1. 去重合并：相同 taskId（同一实例的同类操作）只保留最新的 —— pendingTasks Map
+//        例：实例 A 在 500ms 内心跳了 2 次，只需要复制最新一次
+//     2. 过期丢弃：超过 expiryTime 的任务直接扔掉（expiredTasks 计数）
+//     3. 攒批：把任务按 maxBatchingSize(250个)/maxBatchingDelay(500ms) 攒成一批 → batchWorkQueue
+//   消费者（TaskExecutors 的工作线程）：从 batchWorkQueue 拉取整批任务，
+//     调用 ReplicationTaskProcessor 把一批任务合并成一个 HTTP 请求发给 peer 节点
+//
+//   流量整形（TrafficShaper）：网络拥塞/peer不可用时，延迟任务投递（指数退避思想）
+//   失败重做：可重试的失败任务回流到 reprocessQueue，与新任务合并（新版本优先）
 class AcceptorExecutor<ID, T> {
 
     private static final Logger logger = LoggerFactory.getLogger(AcceptorExecutor.class);

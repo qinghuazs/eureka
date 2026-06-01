@@ -72,6 +72,11 @@ public class PeerEurekaNodes {
         return serverConfig.getHealthStatusMinNumberOfAvailablePeers();
     }
 
+    // 【启动 peer 节点管理】服务端初始化时调用（serverContext.initialize() → peerEurekaNodes.start()）。
+    // 两件事：
+    //   1. 立即解析一次 peer 节点列表（从配置的 serviceUrl 中剔除自己）并创建 PeerEurekaNode
+    //   2. 启动定时任务（默认每 10 分钟）重新解析 —— 支持运行时动态增减集群节点
+    //      （配合 DNS 解析模式，扩容 Eureka 集群无需重启现有节点）
     public void start() {
         taskExecutor = Executors.newSingleThreadScheduledExecutor(
                 new ThreadFactory() {
@@ -84,11 +89,13 @@ public class PeerEurekaNodes {
                 }
         );
         try {
+            // 启动时立即解析并构建 peer 节点列表
             updatePeerEurekaNodes(resolvePeerUrls());
             Runnable peersUpdateTask = new Runnable() {
                 @Override
                 public void run() {
                     try {
+                        // 定时重新解析（支持 DNS/配置变更后动态调整集群拓扑）
                         updatePeerEurekaNodes(resolvePeerUrls());
                     } catch (Throwable e) {
                         logger.error("Cannot update the replica Nodes", e);
@@ -150,6 +157,10 @@ public class PeerEurekaNodes {
      *
      * @param newPeerUrls peer node URLs; this collection should have local node's URL filtered out
      */
+    // 【peer 列表的差量更新】比较新旧 URL 集合：
+    //   消失的节点 → 关闭其 PeerEurekaNode（停止批处理分发器、关闭连接）
+    //   新增的节点 → 创建 PeerEurekaNode（建立复制通道）
+    // 整个过程中复制不中断（保留的节点不受影响）
     protected void updatePeerEurekaNodes(List<String> newPeerUrls) {
         if (newPeerUrls.isEmpty()) {
             logger.warn("The replica size seems to be empty. Check the route 53 DNS Registry");

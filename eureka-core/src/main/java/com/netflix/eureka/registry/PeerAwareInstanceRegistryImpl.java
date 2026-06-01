@@ -209,13 +209,21 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * operation fails over to other nodes until the list is exhausted if the
      * communication fails.
      */
+    // 【启动时集群同步】新节点启动时，从 peer 节点把存量注册表"搬"过来。
+    // 实现方式很巧妙：不是专门的同步协议，而是直接复用客户端的拉取能力 ——
+    //   本节点内嵌的 EurekaClient 启动时已经从 peer 拉取了全量注册表到本地缓存，
+    //   这里只需遍历该缓存，把每个实例以"复制注册"（isReplication=true）的方式写入自己的注册表。
+    // 重试机制：同步结果为 0 个实例时重试（默认 5 次，间隔 30s）——
+    //   可能是 peer 还没就绪，也可能自己是集群第一个节点（此时重试耗尽，count=0）
     @Override
     public int syncUp() {
         // Copy entire entry from neighboring DS node
         int count = 0;
 
+        // 重试条件：还有重试次数 且 尚未同步到任何实例
         for (int i = 0; ((i < serverConfig.getRegistrySyncRetries()) && (count == 0)); i++) {
             if (i > 0) {
+                // 第二次起，每次重试前等待 30s（给 EurekaClient 下一轮拉取留时间）
                 try {
                     Thread.sleep(serverConfig.getRegistrySyncRetryWaitMs());
                 } catch (InterruptedException e) {
@@ -223,11 +231,13 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
                     break;
                 }
             }
+            // 从内嵌 EurekaClient 的本地缓存读取注册表（它已经从 peer 拉取过）
             Applications apps = eurekaClient.getApplications();
             for (Application app : apps.getRegisteredApplications()) {
                 for (InstanceInfo instance : app.getInstances()) {
                     try {
                         if (isRegisterable(instance)) {
+                            // 以"复制"方式注册到本地（不会再向外复制，避免风暴）
                             register(instance, instance.getLeaseInfo().getDurationInSecs(), true);
                             count++;
                         }
@@ -240,25 +250,35 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
         return count;
     }
 
+    // 【开放流量】syncUp 完成后调用，让本节点正式开始对外服务。完成四件事：
+    //   1. 用同步到的实例数(count)初始化自我保护基数和阈值
+    //   2. 记录启动时间 + 标记同步是否为空（shouldAllowAccess 用它判断启动保护期）
+    //   3. 把自己的状态改成 UP（其他节点和客户端由此发现本节点可用）
+    //   4. postInit() 启动剔除定时任务（EvictionTask）—— 从此开始正常的租约管理
     @Override
     public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) {
         // Renewals happen every 30 seconds and for a minute it should be a factor of 2.
+        // 自我保护基数 = 同步到的实例数（每个实例每分钟 2 次心跳的预期由 updateRenewsPerMinThreshold 计算）
         this.expectedNumberOfClientsSendingRenews = count;
         updateRenewsPerMinThreshold();
         logger.info("Got {} instances from neighboring DS node", count);
         logger.info("Renew threshold is: {}", numberOfRenewsPerMinThreshold);
         this.startupTime = System.currentTimeMillis();
+        // 同步到了数据 → 不需要启动保护期；同步为空 → 进入保护期（5分钟内拒绝查询请求）
         if (count > 0) {
             this.peerInstancesTransferEmptyOnStartup = false;
         }
         DataCenterInfo.Name selfName = applicationInfoManager.getInfo().getDataCenterInfo().getName();
         boolean isAws = Name.Amazon == selfName;
         if (isAws && serverConfig.shouldPrimeAwsReplicaConnections()) {
+            // AWS 环境：预热与 peer 节点的网络连接（解决 AWS 防火墙首次连接失败问题）
             logger.info("Priming AWS connections for all replicas..");
             primeAwsReplicas(applicationInfoManager);
         }
         logger.info("Changing status to UP");
+        // 把自己标记为 UP —— 客户端和 peer 节点从此可以发现本节点
         applicationInfoManager.setInstanceStatus(InstanceStatus.UP);
+        // 启动剔除定时任务（EvictionTask，每 60s）和续约统计
         super.postInit();
     }
 
@@ -338,13 +358,21 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
      * @return false - if the instances count from a replica transfer returned
      *         zero and if the wait time has not elapsed, otherwise returns true
      */
+    // 【启动保护期检查】注册表查询接口（全量/增量）调用前都会先问这个方法。
+    // 保护场景：节点启动时 syncUp 没拿到任何数据（peer 都不可达/自己是第一个节点），
+    // 此时注册表是空的——如果直接对外提供查询，客户端会拉到"空注册表"，
+    // 误以为所有服务都下线了，导致整个微服务体系的调用关系被清空（灾难性后果）。
+    // 所以：同步为空时，5 分钟（waitTimeInMsWhenSyncEmpty）内拒绝查询（返回403），
+    // 给客户端们留出时间重新注册上来，让注册表"长"回来
     @Override
     public boolean shouldAllowAccess(boolean remoteRegionRequired) {
         if (this.peerInstancesTransferEmptyOnStartup) {
+            // 启动同步为空 且 还在保护期内 → 拒绝访问
             if (!(System.currentTimeMillis() > this.startupTime + serverConfig.getWaitTimeInMsWhenSyncEmpty())) {
                 return false;
             }
         }
+        // 跨 Region 查询时，还要求所有远程 Region 的注册表都已就绪
         if (remoteRegionRequired) {
             for (RemoteRegionRegistry remoteRegionRegistry : this.regionNameVSRemoteRegistry.values()) {
                 if (!remoteRegionRegistry.isReadyForServingData()) {
