@@ -116,6 +116,11 @@ public class ApplicationsResource {
      * @return a response containing information about all {@link com.netflix.discovery.shared.Applications}
      *         from the {@link AbstractInstanceRegistry}.
      */
+    // 【全量拉取的 REST 入口】处理 GET /v2/apps 请求。
+    // 关键设计：请求不直接读注册表，而是读 ResponseCache（响应缓存）——
+    //   缓存中存的是已经序列化好（JSON/XML）甚至已压缩（GZIP）的字节，
+    //   同样的注册表数据只序列化一次，由成千上万的客户端共享，极大降低 CPU 消耗。
+    // 缓存 Key 的维度：实体类型 + ALL_APPS + 格式(JSON/XML) + 版本 + 精简模式 + 地域
     @GET
     public Response getContainers(@PathParam("version") String version,
                                   @HeaderParam(HEADER_ACCEPT) String acceptHeader,
@@ -137,10 +142,12 @@ public class ApplicationsResource {
         // Check if the server allows the access to the registry. The server can
         // restrict access if it is not
         // ready to serve traffic depending on various reasons.
+        // 服务端启动初期（从 peer 同步注册表失败后的保护期内）拒绝提供注册表查询，返回 403
         if (!registry.shouldAllowAccess(isRemoteRegionRequested)) {
             return Response.status(Status.FORBIDDEN).build();
         }
         CurrentRequestVersion.set(Version.toEnum(version));
+        // 根据 Accept 请求头决定返回 JSON 还是 XML
         KeyType keyType = Key.KeyType.JSON;
         String returnMediaType = MediaType.APPLICATION_JSON;
         if (acceptHeader == null || !acceptHeader.contains(HEADER_JSON_VALUE)) {
@@ -148,11 +155,13 @@ public class ApplicationsResource {
             returnMediaType = MediaType.APPLICATION_XML;
         }
 
+        // 构造缓存 Key：名称固定为 ALL_APPS（全量）
         Key cacheKey = new Key(Key.EntityType.Application,
                 ResponseCacheImpl.ALL_APPS,
                 keyType, CurrentRequestVersion.get(), EurekaAccept.fromString(eurekaAccept), regions
         );
 
+        // 从响应缓存读取数据返回（支持 GZIP 压缩格式，进一步节省带宽）
         Response response;
         if (acceptEncoding != null && acceptEncoding.contains(HEADER_GZIP_VALUE)) {
             response = Response.ok(responseCache.getGZIP(cacheKey))
@@ -196,6 +205,10 @@ public class ApplicationsResource {
      * @return response containing the delta information of the
      *         {@link AbstractInstanceRegistry}.
      */
+    // 【增量拉取的 REST 入口】处理 GET /v2/apps/delta 请求。
+    // 增量 = 服务端 recentlyChangedQueue（最近变更队列）中的内容，默认保留最近 3 分钟的变更。
+    // 注意：增量数据带有"全量 hashcode"（appsHashCode），客户端用它做一致性校验，
+    // 校验不过会回退到全量拉取 —— 这是"增量优化 + 全量兜底"的设计
     @Path("delta")
     @GET
     public Response getContainerDifferential(
@@ -209,6 +222,7 @@ public class ApplicationsResource {
 
         // If the delta flag is disabled in discovery or if the lease expiration
         // has been disabled, redirect clients to get all instances
+        // 服务端禁用增量 或 处于启动保护期 → 返回 403，客户端会回退到全量拉取
         if ((serverConfig.shouldDisableDelta()) || (!registry.shouldAllowAccess(isRemoteRegionRequested))) {
             return Response.status(Status.FORBIDDEN).build();
         }

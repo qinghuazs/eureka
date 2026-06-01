@@ -114,8 +114,14 @@ public class ResponseCacheImpl implements ResponseCache {
                 }
             });
 
+    // 【一级缓存：只读缓存】普通 ConcurrentHashMap，客户端请求默认读这里。
+    // 数据来源：每 30s 由定时任务从 readWriteCacheMap 同步（对比引用，不同则更新）。
+    // 特点：读取无任何锁/计算开销，但数据可能滞后最多 30s —— 用延迟换吞吐
     private final ConcurrentMap<Key, Value> readOnlyCacheMap = new ConcurrentHashMap<Key, Value>();
 
+    // 【二级缓存：读写缓存】Guava LoadingCache，写入后 180s 自动过期。
+    // 数据来源：缓存未命中时通过 CacheLoader 调用 generatePayload() 从注册表（三级"真实数据"）实时生成。
+    // 注册/下线/状态变更会主动 invalidate 这一层（但不会动 readOnlyCacheMap，要等 30s 同步）
     private final LoadingCache<Key, Value> readWriteCacheMap;
     private final boolean shouldUseReadOnlyResponseCache;
     private final AbstractInstanceRegistry registry;
@@ -168,6 +174,10 @@ public class ResponseCacheImpl implements ResponseCache {
         }
     }
 
+    // 【只读缓存的定时同步任务】每 30s（responseCacheUpdateIntervalMs）执行一次：
+    // 遍历只读缓存中的每个 Key，到读写缓存中取最新值，引用不同则更新只读缓存。
+    // 这就是"实例注册后，其他客户端最多延迟 30s（这一层）才能看到"的原因。
+    // 注意比较用的是 != （引用比较）而非 equals —— readWriteCacheMap 失效后重新 load 必然产生新对象
     private TimerTask getCacheUpdateTask() {
         return new TimerTask() {
             @Override
@@ -180,8 +190,10 @@ public class ResponseCacheImpl implements ResponseCache {
                     }
                     try {
                         CurrentRequestVersion.set(key.getVersion());
+                        // 从读写缓存取最新值（若已被失效，这里会触发 CacheLoader 从注册表重新生成）
                         Value cacheValue = readWriteCacheMap.get(key);
                         Value currentCacheValue = readOnlyCacheMap.get(key);
+                        // 引用不同说明数据已更新 → 同步到只读缓存
                         if (cacheValue != currentCacheValue) {
                             readOnlyCacheMap.put(key, cacheValue);
                         }
@@ -350,6 +362,10 @@ public class ResponseCacheImpl implements ResponseCache {
     /**
      * Get the payload in both compressed and uncompressed form.
      */
+    // 【缓存读取核心】两级缓存的查找顺序：
+    //   开启只读缓存（默认）：readOnlyCacheMap → 未命中 → readWriteCacheMap → 回填 readOnlyCacheMap
+    //   关闭只读缓存：直接读 readWriteCacheMap（数据更实时，但高并发下回源压力大）
+    // readWriteCacheMap 未命中时，Guava CacheLoader 自动调用 generatePayload() 从注册表生成
     @VisibleForTesting
     Value getValue(final Key key, boolean useReadOnlyCache) {
         Value payload = null;
@@ -359,6 +375,7 @@ public class ResponseCacheImpl implements ResponseCache {
                 if (currentPayload != null) {
                     payload = currentPayload;
                 } else {
+                    // 只读缓存未命中 → 读读写缓存（可能触发从注册表生成数据）→ 回填只读缓存
                     payload = readWriteCacheMap.get(key);
                     readOnlyCacheMap.put(key, payload);
                 }
@@ -409,6 +426,12 @@ public class ResponseCacheImpl implements ResponseCache {
     /*
      * Generate pay load for the given key.
      */
+    // 【缓存回源】读写缓存未命中（或被失效后）时，从注册表实时读取数据并序列化。
+    // 这是"注册表 → 缓存"的数据生成点，按缓存 Key 的名称分三类：
+    //   ALL_APPS       → 全量：registry.getApplications()（遍历整个注册表）
+    //   ALL_APPS_DELTA → 增量：registry.getApplicationDeltas()（读最近变更队列，加写锁！）
+    //   其他           → 单个应用 / VIP / SVIP 查询
+    // 生成的 payload 是序列化后的字符串（JSON/XML），同时缓存 GZIP 压缩版本
     private Value generatePayload(Key key) {
         Stopwatch tracer = null;
         try {
@@ -422,6 +445,7 @@ public class ResponseCacheImpl implements ResponseCache {
                             tracer = serializeAllAppsWithRemoteRegionTimer.start();
                             payload = getPayLoad(key, registry.getApplicationsFromMultipleRegions(key.getRegions()));
                         } else {
+                            // 全量：从注册表读取所有应用并序列化（耗时操作，靠缓存避免重复执行）
                             tracer = serializeAllAppsTimer.start();
                             payload = getPayLoad(key, registry.getApplications());
                         }
@@ -433,12 +457,15 @@ public class ResponseCacheImpl implements ResponseCache {
                             payload = getPayLoad(key,
                                     registry.getApplicationDeltasFromMultipleRegions(key.getRegions()));
                         } else {
+                            // 增量：读取最近变更队列（recentlyChangedQueue）并序列化
+                            // 注意 getApplicationDeltas() 内部加"写锁"，与注册操作（读锁）互斥
                             tracer = serializeDeltaAppsTimer.start();
                             versionDelta.incrementAndGet();
                             versionDeltaLegacy.incrementAndGet();
                             payload = getPayLoad(key, registry.getApplicationDeltas());
                         }
                     } else {
+                        // 单个应用查询
                         tracer = serializeOneApptimer.start();
                         payload = getPayLoad(key, registry.getApplication(key.getName()));
                     }

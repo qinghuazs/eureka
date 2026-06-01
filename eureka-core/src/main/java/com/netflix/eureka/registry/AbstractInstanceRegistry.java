@@ -910,13 +910,21 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      * The new behavior is to explicitly specify if you need a remote region.
      */
     @Deprecated
+    // 【生成增量数据】把"最近变更队列"（recentlyChangedQueue，保留最近 3 分钟的注册/下线/状态变更）
+    // 转换成 Applications 结构返回。由 ResponseCache 回源时调用（GET /v2/apps/delta 未命中缓存）。
+    // 注意这里加的是"写锁"：
+    //   - 与注册/下线（读锁）互斥 —— 保证生成增量期间注册表不被修改，增量数据 + hashcode 是一致的快照
+    //   - 这正是注册用"读锁"的原因：注册之间可并发，但注册与"读增量"必须互斥
+    // 返回的数据中附带全量 hashcode（appsHashCode），客户端用它校验增量合并的正确性
     public Applications getApplicationDeltas() {
         GET_ALL_CACHE_MISS_DELTA.increment();
         Applications apps = new Applications();
         apps.setVersion(responseCache.getVersionDelta().get());
         Map<String, Application> applicationInstancesMap = new HashMap<String, Application>();
+        // 加写锁：与注册（读锁）互斥
         write.lock();
         try {
+            // 遍历最近变更队列，把每条变更（含 ActionType: ADDED/MODIFIED/DELETED）加入返回结果
             Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
             logger.debug("The number of elements in the delta queue is : {}",
                     this.recentlyChangedQueue.size());
@@ -953,6 +961,8 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                 }
             }
 
+            // 关键：增量响应中附带"当前全量数据的 hashcode"，
+            // 客户端合并增量后比对 hashcode，不一致则回退全量拉取（一致性兜底）
             Applications allApps = getApplications(!disableTransparentFallback);
             apps.setAppsHashCode(allApps.getReconcileHashCode());
             return apps;

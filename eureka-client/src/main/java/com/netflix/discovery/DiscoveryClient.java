@@ -1025,12 +1025,20 @@ public class DiscoveryClient implements EurekaClient {
      *
      * @return true if the registry was fetched
      */
+    // 【拉取注册表总入口】决定走"全量拉取"还是"增量拉取"。
+    // 默认策略：首次全量，之后增量（增量失败或校验不一致时回退全量）。
+    // 满足以下任一条件走全量：
+    //   1. 配置禁用了增量（shouldDisableDelta）
+    //   2. 配置了只关注某个 VIP 地址
+    //   3. 上层要求强制全量（forceFullRegistryFetch）
+    //   4. 本地缓存还是空的（首次拉取）
     private boolean fetchRegistry(boolean forceFullRegistryFetch) {
         Stopwatch tracer = FETCH_REGISTRY_TIMER.start();
 
         try {
             // If the delta is disabled or if it is the first time, get all
             // applications
+            // 取本地缓存的注册表（用于判断是否首次拉取）
             Applications applications = getApplications();
 
             if (clientConfig.shouldDisableDelta()
@@ -1047,10 +1055,13 @@ public class DiscoveryClient implements EurekaClient {
                 logger.info("Registered Applications size is zero : {}",
                         applications.isRegisteredApplicationsEmpty());
                 logger.info("Application version is -1: {}", (applications.getVersion() == -1));
+                // 全量拉取：GET /v2/apps，整体替换本地缓存
                 getAndStoreFullRegistry();
             } else {
+                // 增量拉取：GET /v2/apps/delta，合并到本地缓存 + hashcode 一致性校验
                 getAndUpdateDelta(applications);
             }
+            // 重新计算本地缓存的 hashcode（下次增量校验的基准）
             applications.setAppsHashCode(applications.getReconcileHashCode());
             logTotalInstances();
         } catch (Throwable e) {
@@ -1064,9 +1075,11 @@ public class DiscoveryClient implements EurekaClient {
         }
 
         // Notify about cache refresh before updating the instance remote status
+        // 通知缓存刷新事件（CacheRefreshedEvent，业务可监听）
         onCacheRefreshed();
 
         // Update remote status based on refreshed data held in the cache
+        // 从拉到的注册表中找到"自己"，检查服务端视角的本实例状态是否变化（变化则发事件）
         updateInstanceRemoteStatus();
 
         // registry was fetched successfully, so return true
@@ -1127,11 +1140,15 @@ public class DiscoveryClient implements EurekaClient {
      * @throws Throwable
      *             on error.
      */
+    // 【全量拉取】GET /v2/apps 拿到服务端完整注册表，原子地整体替换本地缓存。
+    // 并发控制：用"代数"(generation) CAS 防止并发更新 ——
+    //   进入方法时记下当前代数，写入前 CAS 把代数+1，失败说明其他线程已更新过，放弃本次结果
     private void getAndStoreFullRegistry() throws Throwable {
         long currentUpdateGeneration = fetchRegistryGeneration.get();
 
         logger.info("Getting all instance registry info from the eureka server");
 
+        // 发起全量查询（普通场景查所有应用；配置了单 VIP 模式则只查该 VIP 下的实例）
         Applications apps = null;
         EurekaHttpResponse<Applications> httpResponse = clientConfig.getRegistryRefreshSingleVipAddress() == null
                 ? eurekaTransport.queryClient.getApplications(remoteRegionsRef.get())
@@ -1144,6 +1161,7 @@ public class DiscoveryClient implements EurekaClient {
         if (apps == null) {
             logger.error("The application is null for some reason. Not storing this information");
         } else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
+            // CAS 成功才写入：filterAndShuffle 会过滤掉非 UP 实例（可配置）并随机打乱顺序（负载均衡）
             localRegionApps.set(this.filterAndShuffle(apps));
             logger.debug("Got full registry with apps hashcode {}", apps.getAppsHashCode());
         } else {
@@ -1164,9 +1182,16 @@ public class DiscoveryClient implements EurekaClient {
      * @return the client response
      * @throws Throwable on error
      */
+    // 【增量拉取】GET /v2/apps/delta 拿到最近 3 分钟的变更记录，合并进本地缓存。
+    // 增量数据来源于服务端的 recentlyChangedQueue（注册/下线/状态变更都会进队列）。
+    // 一致性保障 —— hashcode 校验：
+    //   服务端在增量响应中附带"全量数据的 hashcode"（appsHashCode），
+    //   客户端合并增量后计算本地 hashcode，两者不一致说明增量合并出错（丢过增量/乱序），
+    //   此时回退做一次全量拉取（reconcile），保证最终一致
     private void getAndUpdateDelta(Applications applications) throws Throwable {
         long currentUpdateGeneration = fetchRegistryGeneration.get();
 
+        // 发起增量查询
         Applications delta = null;
         EurekaHttpResponse<Applications> httpResponse = eurekaTransport.queryClient.getDelta(remoteRegionsRef.get());
         if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
@@ -1174,15 +1199,19 @@ public class DiscoveryClient implements EurekaClient {
         }
 
         if (delta == null) {
+            // 服务端禁用了增量（或不安全）→ 回退全量拉取
             logger.warn("The server does not allow the delta revision to be applied because it is not safe. "
                     + "Hence got the full registry.");
             getAndStoreFullRegistry();
         } else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
             logger.debug("Got delta update with apps hashcode {}", delta.getAppsHashCode());
             String reconcileHashCode = "";
+            // tryLock 而非 lock：拿不到锁说明另一个线程正在更新，直接放弃（避免重复合并增量）
             if (fetchRegistryUpdateLock.tryLock()) {
                 try {
+                    // 把增量逐条合并到本地缓存（按 ADDED/MODIFIED/DELETED 分类处理）
                     updateDelta(delta);
+                    // 合并完成后计算本地数据的 hashcode
                     reconcileHashCode = getReconcileHashCode(applications);
                 } finally {
                     fetchRegistryUpdateLock.unlock();
@@ -1191,6 +1220,7 @@ public class DiscoveryClient implements EurekaClient {
                 logger.warn("Cannot acquire update lock, aborting getAndUpdateDelta");
             }
             // There is a diff in number of instances for some reason
+            // 【一致性校验】本地 hashcode 与服务端 hashcode 不一致 → 增量合并出错 → 全量拉取修复
             if (!reconcileHashCode.equals(delta.getAppsHashCode()) || clientConfig.shouldLogDeltaDiff()) {
                 reconcileAndLogDifference(delta, reconcileHashCode);  // this makes a remoteCall
             }
@@ -1536,6 +1566,9 @@ public class DiscoveryClient implements EurekaClient {
      * The task that fetches the registry information at specified intervals.
      *
      */
+    // 【注册表刷新线程】被 TimedSupervisorTask 包装后定时执行（默认每 30s），
+    // 是客户端"服务发现"能力的数据来源：把服务端的注册表拉到本地缓存（localRegionApps），
+    // 业务代码调用 getApplications()/getInstancesByVipAddress() 读的都是这份本地缓存
     class CacheRefreshThread implements Runnable {
         public void run() {
             refreshRegistry();
