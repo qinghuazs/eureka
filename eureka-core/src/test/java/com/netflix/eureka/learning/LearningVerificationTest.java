@@ -20,6 +20,7 @@ import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -257,8 +258,141 @@ public class LearningVerificationTest {
     }
 
     // ==================================================================================
+    // 论断五（文档04 剔除上限）：单次剔除上限 = 注册表大小 - (int)(大小 × 0.85)
+    // 文档反复说"×15%"，但因 int 截断，"15%"只在 size=100 时精确成立，规模越小占比越大。
+    // 见 AbstractInstanceRegistry.java:683-685
+    // ==================================================================================
+
+    /**
+     * 验证剔除上限公式，并揭示文档"15%"说法的边界：int 截断使它只在 size=100 时恰好等于 15%。
+     */
+    @Test
+    public void eviction_limit_is_size_minus_floor_of_85_percent() {
+        // size=100：恰好剔除 15 个（= 15%），这正是文档"×15%"说法的来源
+        assertEquals("100 个实例单次最多剔除 15 个", 15, evictionLimit(100));
+
+        // 但 int 截断让"15%"只是 size=100 的巧合——小规模实际占比明显更大：
+        assertEquals("10 个实例上限是 2(=20%,并非15%)", 2, evictionLimit(10));
+        assertEquals("7 个实例上限是 2(≈28.6%)", 2, evictionLimit(7));
+        assertEquals("1 个实例上限是 1(=100%,单实例注册表几乎无上限保护)", 1, evictionLimit(1));
+    }
+
+    // ==================================================================================
+    // 论断六（文档04 补偿时间）：getCompensationTimeMs = 实际间隔 - 配置间隔(60s)，取非负。
+    // 修正 Full GC / 时钟漂移导致剔除任务延迟执行时的大面积误剔除。
+    // 见 AbstractInstanceRegistry.java:1368-1369
+    // ==================================================================================
+
+    /**
+     * 验证补偿时间公式的三种情形，重点是"负值钳为 0"——绝不能反向缩短租约。
+     */
+    @Test
+    public void compensation_time_is_elapsed_minus_interval_clamped_to_zero() {
+        long interval = 60_000L;  // 默认剔除周期 60s
+        // 发生 30s 的 Full GC,本次任务实际间隔 90s 才执行 → 补偿 30s
+        assertEquals("实际间隔90s,配置60s → 补偿30s", 30_000L, compensationTimeMs(90_000L, interval));
+        // 正常按时执行 → 不补偿
+        assertEquals("实际间隔=配置间隔 → 补偿0", 0L, compensationTimeMs(60_000L, interval));
+        // 提前执行(时钟回拨) → 补偿钳为0,绝不返回负数(否则会反向缩短租约导致误剔除)
+        assertEquals("实际间隔小于配置 → 补偿钳为0,不为负", 0L, compensationTimeMs(50_000L, interval));
+    }
+
+    // ==================================================================================
+    // 论断七（文档04 主动下线即时生效）：Lease.cancel() 后立即过期，与续约时间无关。
+    // 见 Lease.java:86-90（evictionTimestamp）、:132-133（isExpired 的 evictionTimestamp>0 分支）
+    // ==================================================================================
+
+    /**
+     * 验证 cancel() 走的是 evictionTimestamp>0 分支，立即过期——这是"主动下线即时生效"
+     * 与"被动剔除靠租约超时(默认 180s)"两套机制的分界。
+     */
+    @Test
+    public void lease_cancel_expires_immediately_regardless_of_renewal() {
+        InstanceInfo instance = createInstance("cancel-instance");
+        Lease<InstanceInfo> lease = new Lease<>(instance, 90);  // 90s 租约
+        lease.renew();
+        assertFalse("刚续约,远未到期", lease.isExpired());
+
+        lease.cancel();  // 主动下线
+        // evictionTimestamp>0 这一支让 isExpired 立即为 true,不必等 2*duration 的租约超时
+        assertTrue("cancel()后应立即过期(主动下线即时生效)", lease.isExpired());
+    }
+
+    // ==================================================================================
+    // 论断八（文档04 补偿语义）：isExpired(additionalLeaseMs) 把过期时刻整体后移，
+    // 即剔除任务延迟时给所有实例"续上"进程暂停的那段时间。见 Lease.java:132-133
+    // ==================================================================================
+
+    /**
+     * 验证 additionalLeaseMs 的方向：同一条已越过过期时刻的租约，加上正补偿后又被判为未过期。
+     */
+    @Test
+    public void additional_lease_ms_postpones_expiry_for_gc_compensation() throws InterruptedException {
+        InstanceInfo instance = createInstance("compensation-instance");
+        Lease<InstanceInfo> lease = new Lease<>(instance, 1);  // 1s 租约(因 +duration bug 实际 2s 才过期)
+        lease.renew();
+        Thread.sleep(2100);  // 越过 2*duration,无补偿时已过期
+
+        assertTrue("无补偿:已越过实际过期时刻", lease.isExpired(0L));
+        assertFalse("加 5s 补偿:过期时刻整体后移,又判定为未过期", lease.isExpired(5_000L));
+    }
+
+    // ==================================================================================
+    // 论断九（文档03 增量对账触发）：客户端本地合并后算出的 reconcileHashCode 与服务端返回的
+    // appsHashCode 一致则不全量、不一致则触发全量兜底——这是 hashcode 机制存在的全部理由。
+    // 见 DiscoveryClient 中 if(!reconcileHashCode.equals(delta.getAppsHashCode())) 的判定
+    // ==================================================================================
+
+    /**
+     * 用纯模型对象验证"hashcode 一致=不全量、不一致=全量"的决策点：
+     * 状态计数一致即视为合并正确（无需逐实例比对），漏删一条会立即被指纹发现。
+     */
+    @Test
+    public void reconcile_hashcode_decides_whether_full_fetch_is_triggered() {
+        // 服务端基线:2 个 UP + 1 个 DOWN
+        Applications serverSide = appsWith("RECON-APP", 2, 1);
+        String serverHash = serverSide.getReconcileHashCode();
+
+        // 客户端"正确"增量合并后:状态计数一致(实例 id 不同也无所谓)→ hashcode 相等 → 不触发全量
+        Applications correctlyMerged = appsWith("RECON-APP", 2, 1);
+        assertEquals("合并正确,hashcode一致 → 不触发全量对账",
+                serverHash, correctlyMerged.getReconcileHashCode());
+
+        // 客户端"漏掉一条 DELETE"导致多留一个 DOWN 实例:计数不一致 → hashcode 不等 → 触发全量
+        Applications staleMerged = appsWith("RECON-APP", 2, 2);
+        assertNotEquals("合并漏删,hashcode不一致 → 触发全量对账修复",
+                serverHash, staleMerged.getReconcileHashCode());
+    }
+
+    // ==================================================================================
     // 工具方法
     // ==================================================================================
+
+    /** 复刻 AbstractInstanceRegistry.java:683-685 的单次剔除上限公式（默认阈值 0.85）。 */
+    private static int evictionLimit(int registrySize) {
+        int registrySizeThreshold = (int) (registrySize * 0.85);
+        return registrySize - registrySizeThreshold;
+    }
+
+    /** 复刻 AbstractInstanceRegistry.java:1368-1369 的补偿时间公式（负值钳为 0）。 */
+    private static long compensationTimeMs(long elapsedMs, long intervalMs) {
+        long compensationTime = elapsedMs - intervalMs;
+        return compensationTime <= 0L ? 0L : compensationTime;
+    }
+
+    /** 构造一个含 upCount 个 UP、downCount 个 DOWN 实例的 Applications，用于 hashcode 对账验证。 */
+    private Applications appsWith(String appName, int upCount, int downCount) {
+        Applications applications = new Applications();
+        Application app = new Application(appName);
+        for (int i = 0; i < upCount; i++) {
+            app.addInstance(createInstanceWithStatus(appName + "-up-" + i, InstanceStatus.UP));
+        }
+        for (int i = 0; i < downCount; i++) {
+            app.addInstance(createInstanceWithStatus(appName + "-down-" + i, InstanceStatus.DOWN));
+        }
+        applications.addApplication(app);
+        return applications;
+    }
 
     private InstanceInfo createInstance(String id) {
         return createInstanceWithStatus(id, InstanceStatus.UP);
