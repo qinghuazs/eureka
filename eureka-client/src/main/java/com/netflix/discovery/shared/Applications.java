@@ -61,6 +61,23 @@ import com.thoughtworks.xstream.annotations.XStreamImplicit;
  * @author Karthik Ranganathan
  *
  */
+/*
+ * 【中文说明 · 对应文档03/09:增量拉取与一致性指纹】
+ * Applications 是客户端本地"全量注册表快照"的载体：它把服务端返回的所有 Application
+ * (每个应用下若干 InstanceInfo) 聚合在一起，并维护 VIP/SecureVIP 的路由索引。
+ *
+ * 本类在整条拉取流程里最关键的角色,是承载"一致性指纹 (reconcile hash code)"这套
+ * 增量拉取的兜底校验机制:
+ *  - 客户端首次走全量拉取拿到完整注册表,之后每个周期只拉【增量 delta】(新增/修改/删除若干实例)。
+ *  - 客户端把 delta 合并进本地这份 Applications 快照后,本地用 getReconcileHashCode() 自行
+ *    算出一个指纹字符串(形如 "UP_10_DOWN_2_"),再和服务端在响应里带回来的 appsHashCode 比对。
+ *  - 若两者相等 => 认为本地快照与服务端一致,本轮增量合并成功,无需做任何额外动作;
+ *    若不相等 => 说明增量合并过程中丢了/串了数据,客户端立即放弃增量、改走一次【全量拉取】做兜底
+ *    (即文档09里说的 reconcile/对账)。
+ *
+ * 注意这只是"低成本一致性自检",不是强一致保证:见下方 getReconcileHashCode 的说明,
+ * 指纹只编码"各状态有多少个实例",对实例的具体内容(IP/端口/元数据/到底是哪台上线哪台下线)不敏感。
+ */
 @Serializer("com.netflix.discovery.converters.EntityBodyConverter")
 @XStreamAlias("applications")
 @JsonRootName("applications")
@@ -115,14 +132,24 @@ public class Applications {
         }
     }
 
+    // 指纹字符串里"状态名"与"数量"之间、以及各段之间的分隔符,例如 UP_10_DOWN_2_ 里的下划线
     private static final String STATUS_DELIMITER = "_";
 
+    // 【一致性指纹 · 文档09核心字段】服务端在拉取响应里带回的注册表指纹。
+    // 客户端把本轮增量(delta)合并到本地快照后,会用 getReconcileHashCode() 自算一个指纹,
+    // 与这个 appsHashCode 比对:相等=>增量合并一致;不相等=>触发一次全量拉取兜底(reconcile)。
+    // 它本身只是个普通字符串(形如 "UP_10_DOWN_2_"),并不参与 Java 对象的 equals/hashCode。
     private String appsHashCode;
+    // 增量版本号(delta 版本),由服务端维护并随响应返回,用于标识"这是第几代增量",辅助判断 delta 是否衔接。
     private Long versionDelta;
     @XStreamImplicit
+    // 本地持有的全部应用集合;用 ConcurrentLinkedQueue 是为了在拉取线程更新、调用线程读取时弱一致并发安全
     private final AbstractQueue<Application> applications;
+    // 应用名(大写) -> Application 的索引,供按 appName 快速定位
     private final Map<String, Application> appNameApplicationMap;
+    // VIP 地址(大写) -> 该 VIP 下实例的路由索引(含轮询游标 + 洗牌后的实例列表),供按 VIP 做客户端负载均衡
     private final Map<String, VipIndexSupport> virtualHostNameAppMap;
+    // 安全 VIP(HTTPS)地址 -> 路由索引,语义同上,只是针对 secureVipAddress
     private final Map<String, VipIndexSupport> secureVirtualHostNameAppMap;
 
     /**
@@ -275,6 +302,21 @@ public class Applications {
      * @return the internal hash code representation indicating the information
      *         about the instances.
      */
+    /*
+     * 【一致性指纹入口 · 文档09核心方法】对"当前这份本地快照"算出指纹字符串。
+     * 客户端在合并完增量(delta)后调用本方法,把结果与服务端返回的 appsHashCode 比对,
+     * 决定要不要走全量拉取兜底。
+     *
+     * 实现分两步:
+     *  1) populateInstanceCountMap:遍历所有实例,按 InstanceStatus 统计【各状态各有多少个实例】;
+     *     这里用 TreeMap 是关键——按状态名升序排列,保证客户端和服务端拼出来的字符串顺序一致,
+     *     否则同样的计数因 Map 遍历顺序不同会得到不同字符串,导致误判。
+     *  2) getReconcileHashCode(map):把计数 Map 拼成 "状态_数量_状态_数量_" 形式的指纹。
+     *
+     * 划重点(文档03/09反复强调):指纹只编码"各状态实例的数量",
+     * 对实例的具体内容(IP、端口、元数据、到底是哪台机器上线/下线)完全不敏感。
+     * 因此只能粗粒度地发现"数量对不上"这类增量丢失,不能保证逐实例内容一致。
+     */
     @JsonIgnore
     public String getReconcileHashCode() {
         TreeMap<String, AtomicInteger> instanceCountMap = new TreeMap<String, AtomicInteger>();
@@ -289,15 +331,29 @@ public class Applications {
      * @param instanceCountMap
      *            the map to populate
      */
+    /*
+     * 【指纹的数据来源 · 统计各状态实例数量】把"当前快照里每种 InstanceStatus 各有多少个实例"
+     * 填进 instanceCountMap(状态名 -> 计数)。这一步就是指纹"只看数量、不看内容"的根因所在:
+     * 它把每个实例坍缩成"它处于哪个状态",其余信息全部丢弃。
+     *
+     * 性能上做了两段式优化(因为该方法在每个拉取周期都会跑,且实例可能上万):
+     *  1) 先用一个按 ordinal 下标的 int[] 计数,遍历所有实例时只做一次自增,
+     *     避免在热路径上反复操作 Map / 装箱;
+     *  2) 再单趟把 int[] 里非零的状态写进对外的 Map(只暴露真正出现过的状态)。
+     */
     public void populateInstanceCountMap(Map<String, AtomicInteger> instanceCountMap) {
         // accrue here as lightweight as possible
+        // 用状态枚举的 ordinal 作为下标的轻量计数数组,遍历期间零额外分配
         int[] statusCounts = new int[InstanceStatus.values().length];
+        // 对每个实例:取其状态,在对应下标上 +1
         Consumer<InstanceInfo> countByStatus = info -> statusCounts[info.getStatus().ordinal()]++;
         for (Application app : this.applications) {
             app.forEachInstance(countByStatus);
         }
 
         // now convert it over to the API form in a single pass
+        // 把数组里的计数单趟转成对外 Map;count>0 的过滤保证"没有该状态的实例就不写入",
+        // 这样后续指纹串里也不会出现 0 计数的噪声段
         for (InstanceStatus status : InstanceStatus.values()) {
             int count = statusCounts[status.ordinal()];
             if (count > 0) {
@@ -315,6 +371,16 @@ public class Applications {
      * @param instanceCountMap
      *            the instance count map to use for generating the hash
      * @return the hash code for this instance
+     */
+    /*
+     * 【指纹拼装 · 把计数 Map 拼成 "状态_数量_状态_数量_"】例如有 10 个 UP、2 个 DOWN 的实例,
+     * 传入的(已按状态名排序的)Map 会被拼成字符串 "DOWN_2_UP_10_"。
+     * 每段格式为:状态名 + "_" + 数量 + "_"。
+     *
+     * 之所以能拿来做客户端/服务端比对:只要两边"各状态的实例总数"完全相同,且遍历顺序一致
+     * (调用方用 TreeMap 保证有序),拼出来的字符串就逐字符相等。客户端正是用这个字符串去和
+     * 服务端响应里的 appsHashCode 做 String 相等判断,决定本轮增量是否可信、要不要全量兜底。
+     * 再次强调:它对实例的具体身份/内容无感知,只是个廉价的"数量级一致性"校验。
      */
     public static String getReconcileHashCode(Map<String, AtomicInteger> instanceCountMap) {
         StringBuilder reconcileHashCode = new StringBuilder(75);

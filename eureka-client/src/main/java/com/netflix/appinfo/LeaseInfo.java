@@ -34,20 +34,43 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  * @author Karthik Ranganathan, Greg Kim
  *
  */
+/*
+ * 【中文导读 · 对应文档09(三大数据模型之一)】
+ * LeaseInfo 是租约信息在「客户端侧」的数据载体，作为 InstanceInfo 的一个字段随注册请求一起上报到服务端。
+ * 它包含两类信息：
+ *   1) Client settings(客户端声明的续约参数)：renewalIntervalInSecs / durationInSecs，由客户端配置后随注册发给服务端，
+ *      告诉服务端"我多久续约一次、超过多久没续约就可以认为我挂了"。
+ *   2) Server populated(服务端填充的时间戳)：registration / lastRenewal / eviction / serviceUp 等，
+ *      由服务端在注册、续约、剔除等动作发生时回写。
+ *
+ * 重要对照：本类与服务端的 com.netflix.eureka.lease.Lease(已注释)是一对"声明 ↔ 判定"的关系——
+ *   · LeaseInfo 是客户端「声明」的续约参数(意图/契约)；
+ *   · 服务端 Lease 则据此持有 duration 并实现 isExpired()，依据 lastUpdateTimestamp 与 duration 判断租约是否过期。
+ * 也就是说：客户端在 LeaseInfo 里说"我承诺这个续约节奏"，服务端 Lease 拿着这个承诺去做过期裁决与剔除(evict)。
+ */
 @JsonRootName("leaseInfo")
 public class LeaseInfo {
 
+    // 续约间隔默认值：30 秒。即客户端默认每 30s 向服务端发送一次心跳(续约)。
     public static final int DEFAULT_LEASE_RENEWAL_INTERVAL = 30;
+    // 租约时长默认值：90 秒。即服务端默认在最近一次续约后 90s 内未再收到续约，就认为该租约过期。
+    // 默认 90s 恰为续约间隔 30s 的 3 倍，留出容忍若干次心跳丢失的余量。
     public static final int DEFAULT_LEASE_DURATION = 90;
 
-    // Client settings
+    // ===== Client settings：客户端声明的续约参数，随注册请求上报，服务端据此判过期 =====
+    // 续约间隔(秒)：客户端两次心跳之间的间隔，默认 30s。
     private int renewalIntervalInSecs = DEFAULT_LEASE_RENEWAL_INTERVAL;
+    // 租约时长(秒)：服务端允许的"最长无续约时间"，超过即视为过期，默认 90s。对应服务端 Lease 的 duration。
     private int durationInSecs = DEFAULT_LEASE_DURATION;
 
-    // Server populated
+    // ===== Server populated：以下时间戳由服务端在相应动作发生时填充 =====
+    // 注册时间戳：该租约首次注册到服务端的时刻(epoch 毫秒)。
     private long registrationTimestamp;
+    // 最近一次续约时间戳：服务端最后一次收到该实例心跳的时刻；服务端用它 + durationInSecs 判定是否过期。
     private long lastRenewalTimestamp;
+    // 剔除时间戳：该租约被服务端下线/剔除(主动注销或过期被 evict)的时刻。
     private long evictionTimestamp;
+    // 服务上线时间戳：该实例状态被标记为 UP(对外可用)的时刻。
     private long serviceUpTimestamp;
 
     public static final class Builder {

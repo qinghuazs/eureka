@@ -51,6 +51,15 @@ import org.slf4j.LoggerFactory;
  *
  * @author Karthik Ranganathan, Greg Kim
  */
+/*
+ * 【中文说明 · 对应文档09】
+ * InstanceInfo 是 Eureka 全链路里被"注册 / 传输 / 缓存"的核心数据载体：它就是"一个服务实例"的完整快照。
+ *  - 注册：客户端启动时把本对象 POST 给 Server（DiscoveryClient.register）；
+ *  - 传输：序列化成 JSON/XML 在网络上往返（@Auto 字段原样序列化，其余按 @Serializer 指定的方式序列化）；
+ *  - 缓存：Server 端 Registry 持有它、客户端本地 Applications 缓存里也存它，整条发现链路传递的都是这个对象。
+ * 关键字段是 status（实例状态机）与 isInstanceInfoDirty/lastDirtyTimestamp（脏标记 + 变更时间戳），
+ * 后者是"本地状态变了要不要增量上报给 Server"的触发源，详见下方对应字段与方法的注释。
+ */
 @ProvidedBy(EurekaConfigBasedInstanceInfoProvider.class)
 @Serializer("com.netflix.discovery.converters.EntityBodyConverter")
 @XStreamAlias("instance")
@@ -139,6 +148,9 @@ public class InstanceInfo {
     private volatile InstanceStatus status = InstanceStatus.UP;
     private volatile InstanceStatus overriddenStatus = InstanceStatus.UNKNOWN;
     @XStreamOmitField
+    // 脏标记：本地 InstanceInfo 自上次成功上报后是否又发生过变更（状态、元数据等）。
+    // @XStreamOmitField 表示它只是客户端进程内的本地控制位，不参与序列化、不会发给 Server。
+    // InstanceInfoReplicator 的定时任务会读它来决定是否需要把变更增量推送给 Server（脏则触发一次 register 上报）。
     private volatile boolean isInstanceInfoDirty = false;
     private volatile LeaseInfo leaseInfo;
     @Auto
@@ -148,6 +160,10 @@ public class InstanceInfo {
     @Auto
     private volatile Long lastUpdatedTimestamp;
     @Auto
+    // 最近一次"变脏"的时间戳（毫秒）。与 isInstanceInfoDirty 配套，但它是 @Auto 字段、会随对象一起序列化上报。
+    // 它是客户端与服务端做"数据新旧对账"的依据：心跳(renew)会带上这个时间戳，
+    // Server 比对自己持有副本的 lastDirtyTimestamp——若客户端更新则要求重新注册(返回 404 触发 re-register)，
+    // 若服务端反而更新则忽略本次心跳(返回 409 CONFLICT)，这正是 404/409 那条对账链路的关键字段。
     private volatile Long lastDirtyTimestamp;
     @Auto
     private volatile ActionType actionType;
@@ -314,6 +330,16 @@ public class InstanceInfo {
     }
 
 
+    /*
+     * 【实例状态机 · 对应文档09】
+     * 实例对外可用性的状态枚举。它直接决定调用方在做服务发现时"能不能把流量打到这个实例"——
+     * 通常只有 UP 的实例才会被消费者纳入可用列表。状态变化也会让实例变脏，从而被增量上报给 Server。
+     *   UP             —— 正常可用，可以接收流量。
+     *   DOWN           —— 不可用，健康检查回调失败，不要给它发流量。
+     *   STARTING       —— 刚启动、还在做初始化，尚未就绪，此时也不接流量。
+     *   OUT_OF_SERVICE —— 被有意下线/摘除（如发布、维护），主动停止接流量但实例仍在注册表中。
+     *   UNKNOWN        —— 状态未知（如解析失败时的兜底值，见下方 toEnum 的容错分支）。
+     */
     public enum InstanceStatus {
         UP, // Ready to receive traffic
         DOWN, // Do not send traffic- healthcheck callback failed
@@ -322,6 +348,7 @@ public class InstanceInfo {
         OUT_OF_SERVICE, // Intentionally shutdown for traffic
         UNKNOWN;
 
+        // 字符串转枚举：忽略大小写解析；解析不出来时不抛异常，统一兜底为 UNKNOWN，保证反序列化健壮性。
         public static InstanceStatus toEnum(String s) {
             if (s != null) {
                 try {
@@ -1241,15 +1268,25 @@ public class InstanceInfo {
      * Sets the dirty flag so that the instance information can be carried to
      * the discovery server on the next heartbeat.
      */
+    /*
+     * 【置脏 · 触发增量上报】任何会改变实例对外表现的本地变更（状态切换、元数据更新等）都会调用它。
+     * 一旦置脏，InstanceInfoReplicator 的下一轮调度就会把本实例重新上报给 Server，让注册表与本地保持一致。
+     * 注意这里同时刷新 lastDirtyTimestamp 为当前时间——这个时间戳后续会随心跳带给 Server 做新旧对账。
+     */
     public synchronized void setIsDirty() {
-        isInstanceInfoDirty = true;
-        lastDirtyTimestamp = System.currentTimeMillis();
+        isInstanceInfoDirty = true;                         // 标记为脏，待上报
+        lastDirtyTimestamp = System.currentTimeMillis();    // 记录变更发生的时刻，作为对账依据
     }
 
     /**
      * Set the dirty flag, and also return the timestamp of the isDirty event
      *
      * @return the timestamp when the isDirty flag is set
+     */
+    /*
+     * 与 setIsDirty() 相同，但额外返回这次变脏的时间戳。
+     * 调用方（如 InstanceInfoReplicator）拿到这个时间戳后，待本次上报成功，
+     * 再用它去调 unsetIsDirty(ts) 做"基于时间戳的乐观清脏"，避免清掉上报期间产生的更新一笔（见下）。
      */
     public synchronized long setIsDirtyWithTime() {
         setIsDirty();
@@ -1263,10 +1300,16 @@ public class InstanceInfo {
      *
      * @param unsetDirtyTimestamp the expected lastDirtyTimestamp to unset.
      */
+    /*
+     * 【乐观清脏 · 防丢更新】上报成功后调用，但只在"上报时记下的时间戳 >= 当前 lastDirtyTimestamp"时才清脏。
+     * 即：若上报期间又发生了新的变更（lastDirtyTimestamp 被刷新得比 unsetDirtyTimestamp 更新），
+     * 则不清脏(走 else 空分支)，保留脏标记让下一轮继续上报，从而不会丢掉这笔并发产生的更新。这是典型的"按版本号CAS"思路。
+     */
     public synchronized void unsetIsDirty(long unsetDirtyTimestamp) {
-        if (lastDirtyTimestamp <= unsetDirtyTimestamp) {
+        if (lastDirtyTimestamp <= unsetDirtyTimestamp) {    // 期间没有更新的变更才清脏
             isInstanceInfoDirty = false;
         } else {
+            // 上报期间又变脏(时间戳更新)，保留脏标记，留待下轮再上报
         }
     }
 
