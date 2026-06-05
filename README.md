@@ -6,7 +6,7 @@ Eureka is a RESTful (Representational State Transfer) service that is primarily 
 discovery, load balancing and failover of middle-tier servers. It plays a critical role in Netflix mid-tier infra.
 
 > 📚 **源码学习资料（`dongmian` 分支）**：本分支在原始 Netflix Eureka 1.x 之上补充了一套完整的中文源码学习资料——
-> 17 份技术文档（5 条核心流程深度分析 + 横向主题 + 实践指南）、10 篇可发布博客、31 个核心类的中文注释、67 个验证测试。
+> 18 份技术文档（5 条核心流程深度分析 + 横向主题 + 实践指南）、10 篇可发布博客、31 个核心类的中文注释、67 个验证测试。
 > 入口见 **[docs/README.md](docs/README.md)**。
 
 Building

@@ -1,7 +1,7 @@
 # Eureka 源码学习资料库
 
 > 本目录是 `dongmian` 分支的核心产出：一套完整的 Netflix Eureka 1.x 源码学习资料，
-> 包含 **17 份技术文档、10 篇博客、约 1050 行源码中文注释、16 个学习验证测试**，
+> 包含 **18 份技术文档、10 篇博客、约 1050 行源码中文注释、16 个学习验证测试**，
 > 全部结论经过真实编译运行验证（67 个测试通过：51 官方 + 16 学习验证）。
 
 ## 这个分支有什么
@@ -9,7 +9,7 @@
 | 内容 | 位置 | 说明 |
 |------|------|------|
 | 📖 源码中文注释 | `eureka-client/` `eureka-core/` 的 31 个核心类 | 纯注释零代码变更，`git diff master` 可见 |
-| 📑 技术文档 17 份 | `docs/*.md` | 流程分析（含时序图/状态图/ADR/FMEA）+ 横向主题 + 实践指南 |
+| 📑 技术文档 18 份 | `docs/*.md` | 流程分析（含时序图/状态图/ADR/FMEA）+ 横向主题 + 实践指南 |
 | ✍️ 博客系列 10 篇 | `docs/blog/*.md` | 可直接发布的问题驱动式文章 |
 | 🧪 学习验证测试 | `eureka-core/src/test/java/com/netflix/eureka/learning/` | 用可运行代码验证文档论断 |
 
@@ -70,6 +70,7 @@
 15. [客户端健康检查机制](15.客户端健康检查机制.md) —— HealthCheckHandler/Callback/Bridge，连 Spring Cloud `healthcheck.enabled`
 16. [服务端请求过滤器链](16.服务端请求过滤器链.md) —— StatusFilter/Auth/RateLimiting/Gzip 四道入口关口
 17. [客户端冷启动与 backupRegistry 兜底](17.客户端冷启动与backupRegistry兜底.md) —— Server 全挂时新客户端如何自救
+18. [Eureka 的 AWS 基因（选读）](18.Eureka的AWS基因.md) —— EIP 绑定 / ASG 整组摘流 / DataCenterInfo 的来历；自建机房不触发
 
 ## 快速命令
 
@@ -92,7 +93,7 @@ git diff master --stat -- '*.java' ':(exclude)*learning*'
 ```
 ✅ 5 条核心流程全链路分析（注册/续约/拉取/下线/启动）
 ✅ 31 个核心类中文注释（约 1050 行）
-✅ 38 张 mermaid 图（时序/流程/状态/架构）
+✅ 39 张 mermaid 图（时序/流程/状态/架构）
 ✅ JDK 21 + macOS 实测通过（51 个官方测试 + 16 个学习验证测试）
 ✅ 16 道源码级面试题
 ✅ 10 篇可发布博客（约 3 万字）
