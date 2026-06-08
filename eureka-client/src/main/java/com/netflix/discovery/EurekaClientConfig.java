@@ -75,6 +75,14 @@ public interface EurekaClientConfig {
      * Indicates how long initially (in seconds) to replicate instance info
      * to the eureka server
      */
+    // 【首次复制延迟 · 默认 40s】InstanceInfoReplicator 启动后、第一次把本实例 InstanceInfo 同步(注册)到
+    // 服务端之前要等待的秒数；其后的周期间隔由上面的 getInstanceInfoReplicationIntervalSeconds() 控制(默认 30s)。
+    // 为什么首次要单独留延迟、且比周期长(40>30)？给客户端启动后留一个"信息就绪"窗口——等实例信息收集完整、
+    // 状态/健康检查就绪后再用"成品"信息注册，避免一启动就把半成品上报上去。
+    // 调用链：DiscoveryClient.initScheduledTasks → instanceInfoReplicator.start(本值)：start() 先把 instanceInfo
+    //   标脏，延迟本值(秒)后执行 run() 触发首次 register()（Eureka 用"重新注册"来同步实例信息）。
+    // 配置项 appinfo.initial.replicate.time。坑：start 的形参名叫 initialDelayMs 带 Ms 后缀，实际却按
+    //   TimeUnit.SECONDS 调度——单位是"秒"不是毫秒，别被名字误导。
     int getInitialInstanceInfoReplicationIntervalSeconds();
 
     /**
