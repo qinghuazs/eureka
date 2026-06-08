@@ -112,6 +112,42 @@ import com.netflix.servo.monitor.Stopwatch;
  * @author Spencer Gibb
  *
  */
+/*
+ * 【类总览 · DiscoveryClient = Eureka 客户端的"总入口/上帝类" · 对应文档19】
+ *
+ * 一句话定位：这是应用进程里唯一一个常驻的 Eureka 客户端对象，对外（业务/Ribbon/SpringCloud）是"服务发现 + 自我注册"的门面，
+ * 对内则把"网络传输、本地缓存、后台定时任务、自身状态上报、监控指标"五件事拢在一个类里。它身兼门面与协调者两职，
+ * 所以体量大（约 1900 行）——读它的关键不是逐行读，而是先认清它的"生命周期"和"按职责分块的字段/方法"，再顺藤摸瓜到各专项流程。
+ *
+ * 它在客户端的角色：上层（业务代码 / DiscoveryManager / Spring Cloud 的 EurekaClient 抽象）只跟本类打交道；
+ * 真正干活的网络细节被收进内部类 EurekaTransport（HTTP 工厂 + 服务端地址解析器 + 注册客户端 + 查询客户端），
+ * 真正的"定时执行 + 超时退避"被收进 TimedSupervisorTask，自身状态上报被收进 InstanceInfoReplicator。
+ * 本类是把这些零件组装、启动、并在停机时统一拆解的"装配车间"。
+ *
+ * 生命周期（认准这条主线就不会迷路，详见构造函数与 initScheduledTasks）：
+ *   构造装配 → 首次拉取注册表 → 预注册钩子 → 首次注册 → 启动后台定时任务 → (运行期三大循环) → shutdown 优雅停机
+ *   - 装配顺序有讲究：先初始化基础字段，再做"既不注册也不查询"的提前返回(禁用分支)，
+ *     然后建线程池 → 建网络层(scheduleServerEndpointTask) → 建 AZ→Region 映射；任何一步失败都让构造直接抛错(快速失败)。
+ *
+ * 后台三大循环（运行期真正"活着"的部分，均由 TimedSupervisorTask 包裹做超时监督+指数退避，默认间隔 30s）：
+ *   1) CacheRefreshThread  —— 周期拉服务端注册表，更新本地缓存(读侧数据源)
+ *   2) HeartbeatThread     —— 周期续约维持租约；心跳收 404 时即时重注册("心跳即对账")
+ *   3) InstanceInfoReplicator —— 周期/按需把自身 InstanceInfo 同步给服务端(状态变更可经监听器即时触发)
+ *
+ * 核心字段速览（按职责分块；具体逐字段说明见各字段处与配套导读文档）：
+ *   - 读侧缓存：localRegionApps(本区域注册表) / remoteRegionVsApps(跨区域) / fetchRegistryGeneration + fetchRegistryUpdateLock(防过期线程覆盖)
+ *   - 传输层：eurekaTransport(聚合 bootstrapResolver + registrationClient + queryClient + transportClientFactory)
+ *   - 调度线程：scheduler(2 线程的定时器) + heartbeatExecutor / cacheRefreshExecutor(各自的工作池，SynchronousQueue 隔离) + 两个 TimedSupervisorTask
+ *   - 自身状态：applicationInfoManager / instanceInfo / instanceInfoReplicator / statusChangeListener / healthCheckHandlerRef
+ *   - 监控指标：registryStalenessMonitor / heartbeatStalenessMonitor / 一族 Servo Counter+Timer / stats(对外可查的运行快照)
+ *
+ * 各流程入口导航（软引用方法名，配套专项文档见《19.DiscoveryClient客户端总入口导读》索引表）：
+ *   - 装配：主构造函数 → scheduleServerEndpointTask(建网络) → initScheduledTasks(启动后台)
+ *   - 注册/心跳/下线：register / renew / unregister / shutdown
+ *   - 拉取注册表：fetchRegistry → getAndStoreFullRegistry(全量) / getAndUpdateDelta(增量) / reconcileAndLogDifference(对账)
+ *   - 兜底：fetchRegistryFromBackup(主集群不可用时从备份源读)
+ *   - 查询(门面)：getApplications / getApplication / getInstancesByVipAddress / getInstancesById / getNextServerFromEureka
+ */
 @Singleton
 public class DiscoveryClient implements EurekaClient {
     private static final Logger logger = LoggerFactory.getLogger(DiscoveryClient.class);
@@ -330,6 +366,12 @@ public class DiscoveryClient implements EurekaClient {
         this(applicationInfoManager, config, args, backupRegistryProvider, ResolverUtils::randomize);
     }
     
+    // 【唯一装配入口 / 客户端冷启动】所有重载构造器最终都汇聚到这个 @Inject 标注的方法——读 DiscoveryClient 从这里开始。
+    // 为什么把装配、首次拉取、首次注册全塞进构造函数？因为 Eureka 要求"对象一旦 new 出来就是可用的客户端"(强一致的初始化语义)，
+    // 宁可在构造期快速失败抛错，也不要交付一个"半启动"的客户端给上层。
+    // 装配顺序是有意为之：①填充基础字段/监控开关 → ②"既不注册也不查询"的禁用分支提前 return(省掉线程池与网络层)
+    //   → ③建 scheduler / heartbeatExecutor / cacheRefreshExecutor → ④建网络层 scheduleServerEndpointTask → ⑤建 AZ→Region 映射
+    //   → ⑥首次 fetchRegistry(失败再走 backup 兜底) → ⑦预注册钩子 → ⑧首次 register → ⑨initScheduledTasks 启动后台循环。
     @Inject
     DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
                     Provider<BackupRegistry> backupRegistryProvider, EndpointRandomizer endpointRandomizer) {
@@ -381,6 +423,7 @@ public class DiscoveryClient implements EurekaClient {
 
         logger.info("Initializing Eureka in region {}", clientConfig.getRegion());
 
+        //既不注册，也不查询，则提前结束
         if (!config.shouldRegisterWithEureka() && !config.shouldFetchRegistry()) {
             logger.info("Client configured to neither register nor query for data.");
             scheduler = null;
@@ -503,6 +546,10 @@ public class DiscoveryClient implements EurekaClient {
                 initTimestampMs, initRegistrySize);
     }
 
+    // 【网络层装配】把 eurekaTransport 这个"空壳"填满：HTTP 工厂(transportClientFactory) → 服务端地址解析器(bootstrapResolver)
+    //   → 注册客户端(registrationClient) + 查询客户端(queryClient)。
+    // 为什么注册和查询分两个 client？两者读写特征不同(注册是写、查询是高频读)，分开便于各自做装饰链/缓存/故障转移(详见传输层专项文档06)。
+    // bootstrapResolver 内聚了 DNS/配置解析、端点轮询、健康检测——上层 client 只管发请求，"连哪台服务端"由它决定。
     private void scheduleServerEndpointTask(EurekaTransport eurekaTransport,
                                             AbstractDiscoveryClientOptionalArgs args) {
 
@@ -1370,6 +1417,12 @@ public class DiscoveryClient implements EurekaClient {
     /**
      * Initializes all scheduled tasks.
      */
+    // 【后台引擎点火】客户端从"装配完成"转入"持续运行"的开关：把后台循环注册进 scheduler。
+    // cacheRefresh 与 heartbeat 都用 TimedSupervisorTask 包一层，得到"自调度(执行完才排下一次，不像 fixedRate 会堆积) + 超时监督 + 指数退避"，
+    // 这样网络抖动时间隔自动翻倍(30s→…→最大 30s×backoff)、恢复后又自动回到 30s，避免一次超时就把客户端拖垮。
+    //   - cacheRefresh(拉注册表) 仅在 shouldFetchRegistry 时启用
+    //   - heartbeat(续约) 仅在 shouldRegisterWithEureka 时启用
+    //   - instanceInfoReplicator(自身状态同步) 延迟首启，并把状态变更监听器挂到 ApplicationInfoManager 上实现按需即时上报
     private void initScheduledTasks() {
         if (clientConfig.shouldFetchRegistry()) {
             // registry cache refresh timer
